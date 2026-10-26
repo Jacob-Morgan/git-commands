@@ -14,9 +14,13 @@
 ##       confirm.
 ##   (2) Commit: the staged change is handed to your AI CLI tool, which
 ##       performs the actual `git commit` (writing the message itself).
-##   (3) Push: you're asked, per push, whether this one needs a CI build --
-##       push with CI, push skipping CI (`-o ci.skip`), or don't push. A
+##   (3) Push: you're asked two yes/no questions -- whether to push at all,
+##       and (if so) whether to skip CI (`-o ci.skip`) on that push. A
 ##       first push on a new branch sets upstream (`-u origin <branch>`).
+##
+## When there's nothing new to stage but the branch has commits that were
+## never pushed, step (2) is skipped and you go straight to the push step
+## (so a run after a successful commit-but-failed-push still offers to push).
 ##
 ## Options:
 ##   --ci-skip        Push with `-o ci.skip` without asking (skip CI).
@@ -32,7 +36,8 @@
 ## A configured-but-empty work.aiCommitPrompt is an error, not a fallback.
 ##
 ## With none of --ci-skip / --ci / --no-push, the push step is interactive:
-##   🚀 Push to origin/<branch>?  [c] with CI  [s] skip CI  [n] don't push
+##   🚀 Push to origin/<branch>? [y/N]
+##   ⏭️  Skip CI for this push? [y/N]   (only asked after a yes above)
 ##
 ## AI CLI tool, highest precedence first:
 ##     $AI_CLI_TOOL            (environment override, e.g. "kiro-cli --v3")
@@ -141,6 +146,9 @@ _resolve_ai_tool() {
 _PUSH_MODE="ask"
 _PROMPT=""
 _PROMPT_SET=0
+# Set to 1 when there's nothing new to commit but unpushed commits exist,
+# so we skip the commit handoff and go straight to the push step.
+_SKIP_COMMIT=0
 
 while [ "$#" -gt 0 ]
 do
@@ -230,6 +238,24 @@ echo >&2
 echo "➕ Staging all changes (git add -A)..." >&2
 git add -A
 
+# Count commits on this branch that haven't been pushed to the upstream
+# yet. If there's nothing to stage but unpushed commits exist, we skip the
+# commit step and go straight to the push step rather than bailing out.
+# Prints a number (0 when there's no upstream, or nothing ahead).
+_unpushed_count() {
+	if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+		git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 0
+	else
+		# No upstream: every commit on this branch is unpushed. On an
+		# unborn branch (no HEAD) there are none.
+		if git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+			git rev-list --count HEAD 2>/dev/null || echo 0
+		else
+			echo 0
+		fi
+	fi
+}
+
 # Interactive unstage loop. Show what's staged; let the user remove entries
 # until they're happy. Empty input accepts the current staging.
 while :
@@ -240,8 +266,23 @@ do
 	_staged="$(git diff --cached --name-only)"
 
 	if [ -z "${_staged}" ]; then
-		echo "❌ Nothing is staged to commit." >&2
-		exit 1
+		# Nothing new to commit. But we may have local commits that were
+		# never pushed -- in that case, skip the commit step and head to
+		# the push step instead of exiting.
+		_ahead="$(_unpushed_count)"
+		if [ "${_ahead}" -gt 0 ] 2>/dev/null && [ "${_PUSH_MODE}" != "none" ]; then
+			echo "ℹ️  Nothing new to commit, but ${_ahead} commit(s) on '${_BRANCH}' are not pushed yet." >&2
+			echo >&2
+			_SKIP_COMMIT=1
+			break
+		fi
+		if [ "${_ahead}" -gt 0 ] 2>/dev/null; then
+			# Unpushed commits exist but pushing is disabled (--no-push).
+			echo "ℹ️  Nothing new to commit. ${_ahead} commit(s) are unpushed, but --no-push was given." >&2
+			exit 0
+		fi
+		echo "✅ Nothing to commit and nothing to push; working tree and branch are up to date." >&2
+		exit 0
 	fi
 
 	echo "✅ Staged for commit:" >&2
@@ -271,43 +312,47 @@ do
 	echo "↩️  Unstaged '${_unstage}'." >&2
 done
 
-# Final confirmation before handing off to the AI tool to commit.
-printf '📝 Commit the staged changes with your AI CLI tool? [Y/n] ' >&2
-read -r _ans || _ans=""
-case "${_ans}" in
-	n|N|no|No|NO)
-		echo "🛑 Aborted before commit; your staging is left as-is." >&2
+if [ "${_SKIP_COMMIT}" -eq 0 ]; then
+	# Final confirmation before handing off to the AI tool to commit.
+	printf '📝 Commit the staged changes with your AI CLI tool? [Y/n] ' >&2
+	read -r _ans || _ans=""
+	case "${_ans}" in
+		n|N|no|No|NO)
+			echo "🛑 Aborted before commit; your staging is left as-is." >&2
+			exit 1
+			;;
+	esac
+
+	# -------------------------------------------------------------------
+	# (2) Commit: hand off to the AI CLI tool. The value may carry its own
+	# args (e.g. "kiro-cli --v3"), so leave it unquoted for word-splitting;
+	# the prompt is a single final argument.
+	#
+	# This is a synchronous foreground call: we block until the tool exits
+	# and then branch on its status. We do NOT add a single-shot flag or
+	# assume the tool runs in agent mode -- that's the developer's job via
+	# the configured command (see the "AI CLI tool contract" in the header
+	# comment). A tool that opens an interactive REPL will hold this call
+	# until that session ends; a chat-only tool may exit 0 without
+	# committing anything (the staged-changes check below is the safety
+	# net for that case).
+	# -------------------------------------------------------------------
+	echo "🤖 Handing the commit to: ${_AI_TOOL}" >&2
+	# shellcheck disable=SC2086
+	if ! ${_AI_TOOL} "${_PROMPT}"; then
+		echo "❌ The AI CLI tool exited non-zero; commit not confirmed." >&2
 		exit 1
-		;;
-esac
+	fi
 
-# ---------------------------------------------------------------------------
-# (2) Commit: hand off to the AI CLI tool. The value may carry its own args
-# (e.g. "kiro-cli --v3"), so leave it unquoted for word-splitting; the
-# prompt is a single final argument.
-#
-# This is a synchronous foreground call: we block until the tool exits and
-# then branch on its status. We do NOT add a single-shot flag or assume the
-# tool runs in agent mode -- that's the developer's job via the configured
-# command (see the "AI CLI tool contract" in the header comment). A tool
-# that opens an interactive REPL will hold this call until that session
-# ends; a chat-only tool may exit 0 without committing anything (the staged-
-# changes check below is the safety net for that case).
-# ---------------------------------------------------------------------------
-echo "🤖 Handing the commit to: ${_AI_TOOL}" >&2
-# shellcheck disable=SC2086
-if ! ${_AI_TOOL} "${_PROMPT}"; then
-	echo "❌ The AI CLI tool exited non-zero; commit not confirmed." >&2
-	exit 1
-fi
-
-# Verify a commit actually landed: the index should now be clean of staged
-# changes. If something is still staged, the AI tool didn't commit it.
-if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
-	&& ! git diff --cached --quiet
-then
-	echo "⚠️  Changes are still staged after the AI tool ran -- it may not" >&2
-	echo "   have committed. Check 'git status' before pushing." >&2
+	# Verify a commit actually landed: the index should now be clean of
+	# staged changes. If something is still staged, the AI tool didn't
+	# commit it.
+	if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
+		&& ! git diff --cached --quiet
+	then
+		echo "⚠️  Changes are still staged after the AI tool ran -- it may not" >&2
+		echo "   have committed. Check 'git status' before pushing." >&2
+	fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -320,14 +365,22 @@ if [ "${_PUSH_MODE}" = "none" ]; then
 fi
 
 if [ "${_PUSH_MODE}" = "ask" ]; then
-	printf '🚀 Push to origin/%s?  [c] with CI  [s] skip CI  [n] don'\''t push: ' "${_BRANCH}" >&2
+	# Two plain yes/no questions instead of one three-way prompt:
+	#   (1) push at all?   (2) skip CI on that push?
+	# Default for both is No (Enter = No), so a stray Enter never pushes
+	# and never silently skips CI.
+	printf '🚀 Push to origin/%s? [y/N] ' "${_BRANCH}" >&2
 	read -r _push_ans || _push_ans="n"
 	case "${_push_ans}" in
-		c|C) _PUSH_MODE="ci" ;;
-		s|S) _PUSH_MODE="skip" ;;
-		n|N|"") _PUSH_MODE="none" ;;
+		y|Y|yes|Yes|YES)
+			printf '⏭️  Skip CI for this push? [y/N] ' >&2
+			read -r _ci_ans || _ci_ans="n"
+			case "${_ci_ans}" in
+				y|Y|yes|Yes|YES) _PUSH_MODE="skip" ;;
+				*)               _PUSH_MODE="ci" ;;
+			esac
+			;;
 		*)
-			echo "⚠️  Unrecognised choice '${_push_ans}'; not pushing." >&2
 			_PUSH_MODE="none"
 			;;
 	esac
