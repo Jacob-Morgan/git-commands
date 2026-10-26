@@ -1,0 +1,49 @@
+#!/bin/sh
+
+## Open a remote's web page in a browser.
+##
+## Usage: git browse [remote]
+##
+## Converts the configured URL of the given remote (default: origin) into
+## a browsable https:// URL and opens it. Handles the common remote URL
+## shapes: SCP-style SSH (git@host:group/repo.git), ssh:// (with or
+## without a port), and plain https:// remotes, stripping any userinfo,
+## port, and trailing ".git".
+##
+## The browser is `git web--browse`, honoring $BROWSER (default: `open`,
+## which is the macOS "open in default app" command).
+
+set -e
+
+_REMOTE="${1-origin}"
+
+# Look up the remote's URL. `git config` exits non-zero when the key is
+# absent, which under `set -e` would abort with no explanation, so handle
+# the missing-remote case explicitly.
+if ! _RAW_URL="$(git config "remote.${_REMOTE}.url")" || [ -z "${_RAW_URL}" ]
+then
+	echo "❌ No URL configured for remote '${_REMOTE}'." >&2
+	echo "   Available remotes: $(git remote | paste -sd, - 2>/dev/null)" >&2
+	exit 1
+fi
+
+# Normalize any supported remote URL shape into an https:// web URL:
+#   1. drop the scheme (ssh://, git+ssh://, http(s)://)
+#   2. drop userinfo (anything up to and including a leading "user@")
+#   3. turn a "host:port/" prefix into "host/" (ssh:// with a port)
+#   4. turn the SCP-style "host:path" separator colon into "/"
+#   5. strip a trailing ".git" (with optional trailing slash)
+#   6. strip any remaining trailing slash
+#   7. prepend https://
+URL="$(echo "${_RAW_URL}" | sed -E \
+	-e 's#^ssh://##' \
+	-e 's#^git\+ssh://##' \
+	-e 's#^https?://##' \
+	-e 's#^[^@/]*@##' \
+	-e 's#:([0-9]+)/#/#' \
+	-e 's#:#/#' \
+	-e 's#\.git/?$##' \
+	-e 's#/$##' \
+	| sed -E 's#^#https://#')"
+
+git web--browse --browser "${BROWSER:-open}" "$URL"

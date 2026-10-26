@@ -1,0 +1,273 @@
+#!/bin/sh
+
+## Browse the repositories under the projects directory and print the one
+## you pick.
+##
+## Usage: git find [-d|--dir <projects-dir>] [--help|-h]
+##
+## Reached as `git find`, or directly as `git-find`.
+##
+## Behaviour:
+##   Browses the git repositories under the projects directory (same
+##   resolution as `git get`) with an fzf menu, then prints the chosen
+##   repository's top-level path on the final line, so you can jump there
+##   from your shell:
+##
+##       cd "$(git find)"
+##
+##   A command cannot change its parent shell's directory, so this prints
+##   the path rather than cd-ing itself (the same pattern git-get /
+##   git-edit / git-goto-root use for their result line). Wrap it in a
+##   shell function or alias for a one-word "find a repo and go to it"
+##   gesture; the zsh plugin ships `gfind` for exactly this.
+##
+##   The browse lists only top-level repositories: a ".git" nested inside a
+##   dot-directory (a repo's own ".worktree-branches/"/".worktrees/" root, a
+##   cache, a vendored tree, …) is skipped, so worktrees and submodules
+##   don't clutter the list. It stops descending at each repo root, so it
+##   never walks a repo's working tree (node_modules, build output, …).
+##
+## Options:
+##   -d, --dir <projects-dir>  Root to browse. Defaults to the same source
+##                             as `git get` (see below).
+##
+## Projects directory, highest precedence first:
+##     -d / --dir <path>            (this invocation)
+##     $GIT_GET_PROJECTS_DIR        (environment override)
+##     `git config get.projectsDir` (persistent default)
+##     ~/Projects                   (built-in fallback)
+##
+## Requires `fzf` on $PATH for the interactive menu. Repository discovery
+## uses `fd` when it is installed (much faster on large repo trees; it walks
+## in parallel and stops descending at each repo), and falls back to `find`
+## otherwise. The browse is depth-bounded as a safety valve; override the
+## cap with $GIT_WORK_MAX_DEPTH (default 8; "0"/"none" disables it).
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
+_PROJECTS_DIR_OVERRIDE=""
+_PROJECTS_DIR_SET=0
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		-d|--dir)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_PROJECTS_DIR_OVERRIDE="$2"
+			_PROJECTS_DIR_SET=1
+			shift
+			;;
+		--dir=*)
+			_PROJECTS_DIR_OVERRIDE="${1#--dir=}"
+			_PROJECTS_DIR_SET=1
+			;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			exit 2
+			;;
+		*)
+			echo "❌ Unexpected argument: '$1'." >&2
+			exit 2
+			;;
+	esac
+	shift
+done
+
+if [ "$#" -gt 0 ]
+then
+	echo "❌ Unexpected argument: '$1'." >&2
+	exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# fzf is required for the interactive menu.
+# ---------------------------------------------------------------------------
+if ! command -v fzf >/dev/null 2>&1
+then
+	echo "❌ 'fzf' is required by 'git find' but was not found on \$PATH." >&2
+	echo "   Install it from https://github.com/junegunn/fzf (e.g. 'brew install fzf')." >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the projects directory (env/config) for the browse.
+# Mirrors git-get's resolution, with the -d/--dir flag as highest precedence.
+# ---------------------------------------------------------------------------
+resolve_projects_dir() {
+	if [ "${_PROJECTS_DIR_SET}" -eq 1 ]
+	then
+		if [ -z "${_PROJECTS_DIR_OVERRIDE}" ]
+		then
+			echo "❌ --dir was given but empty." >&2
+			return 1
+		fi
+		_pd="${_PROJECTS_DIR_OVERRIDE}"
+	elif [ -n "${GIT_GET_PROJECTS_DIR+set}" ]
+	then
+		if [ -z "${GIT_GET_PROJECTS_DIR}" ]
+		then
+			echo "❌ \$GIT_GET_PROJECTS_DIR is set but empty." >&2
+			return 1
+		fi
+		_pd="${GIT_GET_PROJECTS_DIR}"
+	elif _pd="$(git config get.projectsDir 2>/dev/null)"
+	then
+		if [ -z "${_pd}" ]
+		then
+			echo "❌ 'git config get.projectsDir' is set but empty." >&2
+			return 1
+		fi
+	else
+		_pd="${HOME}/Projects"
+	fi
+
+	# Expand a leading "~".
+	case "${_pd}" in
+		"~") _pd="${HOME}" ;;
+		"~/"*) _pd="${HOME}/${_pd#~/}" ;;
+	esac
+
+	printf '%s\n' "${_pd}"
+}
+
+# ---------------------------------------------------------------------------
+# List repository toplevels under $1, one per line.
+#
+# A "repository" is any directory holding a ".git" entry (a dir for a normal
+# repo, a file for a linked worktree / submodule). We emit the toplevel (the
+# ".git"'s parent), with two properties that keep this fast on large trees
+# (hundreds to thousands of repos):
+#
+#   * Descent stops at every ".git" match, so the walk never recurses into a
+#     repo's working tree (its src, node_modules, vendor, build output, ...)
+#     -- which is where the vast majority of the filesystem entries live.
+#   * Dot-directories are excluded, so a ".git" nested inside one (a repo's
+#     own worktree root ".worktree-branches/"/".worktrees/", a cache, a
+#     vendored tree, ...) never appears as a separate repo. Only top-level
+#     project repositories are listed.
+#
+# `fd` (https://github.com/sharkdp/fd) is used when available: it walks in
+# parallel and is markedly faster than `find` here. `find` is the fallback,
+# so the command still works with no extra dependency. Both pipe through the
+# same normalisation (strip the trailing "/.git", drop any toplevel that
+# still has a dot-directory ancestor segment).
+#
+# The walk is depth-bounded as a safety valve against pathological non-repo
+# trees. The git-get convention is "<host>/<owner>/<repo>" (the ".git" at
+# depth 4 from the projects root), but forge subgroups nest deeper, so the
+# default cap is generous. Override with $GIT_WORK_MAX_DEPTH; 0 / "" / "none"
+# disables the cap entirely.
+# ---------------------------------------------------------------------------
+list_repos_under() {
+	_root="$1"
+
+	# Resolve the repo-depth cap (depth of the repo toplevel below _root).
+	_depth="${GIT_WORK_MAX_DEPTH:-8}"
+	case "${_depth}" in
+		""|0|none|off|None|Off|NONE|OFF) _depth=0 ;;
+	esac
+
+	if command -v fd >/dev/null 2>&1
+	then
+		# fd matches ".git" by name; --prune stops descent after a match (so
+		# the walk never enters a repo's working tree -- the bulk of the
+		# files); --hidden sees the dotted ".git"; --no-ignore ignores stray
+		# .gitignore/.ignore files so discovery is governed solely by our
+		# dot-dir rule. It walks in parallel, so on large trees it is several
+		# times faster than find. fd's --max-depth counts the ".git" entry,
+		# which sits one level below the repo toplevel, so add 1. Output is
+		# the ".git" path (with a trailing slash for a dir); normalise below.
+		if [ "${_depth}" -gt 0 ]
+		then
+			fd --hidden --no-ignore --glob '.git' "${_root}" \
+				--prune --max-depth "$((_depth + 1))" 2>/dev/null
+		else
+			fd --hidden --no-ignore --glob '.git' "${_root}" \
+				--prune 2>/dev/null
+		fi \
+			| sed 's#/*$##; s#/\.git$##'
+	else
+		# find fallback (no extra dependency). Two prunes keep it from
+		# walking the expensive parts of the tree:
+		#   * dot-directories (except ".git") are pruned, so worktree roots
+		#     (".worktree-branches/", ...) and caches are never entered;
+		#   * a directory that *contains* a ".git" is printed and pruned, so
+		#     find does not descend into the repo's working tree (src,
+		#     node_modules, build output, ...). Without this second prune the
+		#     walk would recurse through every repo's contents -- the slow
+		#     path this whole change exists to avoid.
+		# The repo toplevel is printed directly here, so no "/.git" stripping
+		# is needed. -maxdepth counts the repo dir at _depth below the root.
+		if [ "${_depth}" -gt 0 ]
+		then
+			find "${_root}" -maxdepth "${_depth}" \
+				\( -type d -name '.*' ! -name '.git' -prune \) -o \
+				\( -type d -exec test -e '{}/.git' ';' -print -prune \) \
+				2>/dev/null
+		else
+			find "${_root}" \
+				\( -type d -name '.*' ! -name '.git' -prune \) -o \
+				\( -type d -exec test -e '{}/.git' ';' -print -prune \) \
+				2>/dev/null
+		fi
+	fi \
+		| grep -v '/\.[^/]'
+}
+
+# ---------------------------------------------------------------------------
+# Browse git repositories under the projects directory with fzf, printing
+# the chosen repository's toplevel path.
+#
+# The finder (list_repos_under) streams straight into fzf -- no intervening
+# sort -- so results appear and become selectable as they are discovered,
+# rather than after the whole tree has been walked. fzf's own fuzzy ranking
+# makes a pre-sorted list unnecessary; --scheme=path tunes that ranking for
+# path-shaped input.
+# ---------------------------------------------------------------------------
+select_repo_from_projects() {
+	_root="$(resolve_projects_dir)" || return 1
+
+	if [ ! -d "${_root}" ]
+	then
+		echo "❌ Projects directory '${_root}' does not exist." >&2
+		return 1
+	fi
+
+	echo "📁 Browsing repositories under '${_root}'..." >&2
+
+	_choice="$(
+		list_repos_under "${_root}" \
+			| fzf --prompt="repo> " \
+				--height=80% --reverse --scheme=path \
+				--header="Select a repository (ESC to cancel)"
+	)" || return 1
+
+	if [ -z "${_choice}" ]
+	then
+		echo "❌ No repository selected." >&2
+		return 1
+	fi
+
+	printf '%s\n' "${_choice}"
+}
+
+# ---------------------------------------------------------------------------
+# Main: browse the projects directory and print the chosen repository's
+# toplevel on the final line, so it can be consumed with `cd "$(git find)"`.
+# ---------------------------------------------------------------------------
+select_repo_from_projects

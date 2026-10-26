@@ -1,0 +1,479 @@
+#!/bin/sh
+
+## Clone a repository into a path that mirrors its remote URL.
+##
+## The on-disk layout maps directly onto the remote: a repo at
+##   https://github.com/acme/widget.git
+## is cloned to
+##   <root>/github.com/acme/widget
+## so the folder structure under the root always reflects
+## "<host>/<path>" (with any trailing ".git" removed). This gives a
+## predictable, URL-shaped tree across every forge you use.
+##
+## Usage: git get [--fetch-only|-F] [--worktree|-w <name>] [<repo>]
+##
+##   <repo>   A remote URL (https:// or git@/ssh). When omitted, git get
+##            works on the repository the current directory lives in, in
+##            place, at its actual on-disk location -- a quick "refresh
+##            where I stand" from inside a checkout. With no <repo> and no
+##            current repository, it fails.
+##
+## Behaviour (with a <repo> argument):
+##   - Target directory does not exist  -> clone the default branch into
+##     the computed path.
+##   - Target exists but is not a Git repo -> fail.
+##   - Target exists and is a Git repo  -> update it (see update modes).
+##
+## Behaviour (no <repo> argument):
+##   - Current directory is inside a Git repo -> update it in place (the
+##     update modes below apply). The repo's actual toplevel is used, not
+##     a path re-derived from its remote URL.
+##   - Not in a Git repo -> fail.
+##
+## Update modes (only when the target already exists):
+##   (a) full (default): fetch, stash any local changes, pull/rebase onto
+##       the default branch, then re-apply the stash. Mirrors `git update`.
+##   (b) --fetch-only / -F: fetch only; working tree is left untouched.
+##
+##   In full mode, if the checkout is mid-operation (merge, rebase,
+##   cherry-pick, revert, or bisect) or has unmerged/conflicted paths, the
+##   working-tree update is SKIPPED -- the fetch still refreshes the
+##   remote-tracking refs, but the stash/pull/rebase is not attempted (it
+##   could not stash a conflicted index anyway). git-get prints a warning
+##   and exits successfully, so callers that open the checkout afterwards
+##   (e.g. `git work start`) still let you finish resolving it by hand.
+##
+## Worktrees (--worktree / -w <name>):
+##   Clones (or updates) the default-branch checkout in the main path as
+##   above, then adds a worktree for <name> under the repo's worktree root
+##   (".worktree-branches/<name>" with slashes turned to dashes; override
+##   with $GIT_WORKTREE_ROOT). The named worktree is created if missing and
+##   left as-is if it already exists; the shared fetch keeps its remote-
+##   tracking refs current. Only one --worktree may be given.
+##
+## Config:
+##   Projects directory for the tree (the parent under which
+##   "<host>/<path>" is created), highest precedence first:
+##     $GIT_GET_PROJECTS_DIR     (environment override, per invocation)
+##     `git config get.projectsDir` (persistent default)
+##     ~/Projects                (built-in fallback, matching the old alias)
+##
+##   An explicitly *empty* value for either the environment variable or
+##   the git-config key is treated as a configuration error (the command
+##   fails) rather than silently falling back.
+##
+##   Example ~/.gitconfig:
+##     [get]
+##         projectsDir = ~/Projects
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
+_FETCH_ONLY=0
+_BRANCH=""
+_BRANCH_SET=0
+_REPO=""
+_REPO_SET=0
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		-F|--fetch-only)
+			_FETCH_ONLY=1
+			;;
+		-w|--worktree)
+			if [ "${_BRANCH_SET}" -eq 1 ]
+			then
+				echo "❌ --worktree may only be given once." >&2
+				exit 2
+			fi
+			shift
+			if [ "$#" -eq 0 ]
+			then
+				echo "❌ --worktree requires a branch name." >&2
+				exit 2
+			fi
+			_BRANCH="$1"
+			_BRANCH_SET=1
+			;;
+		--worktree=*)
+			if [ "${_BRANCH_SET}" -eq 1 ]
+			then
+				echo "❌ --worktree may only be given once." >&2
+				exit 2
+			fi
+			_BRANCH="${1#--worktree=}"
+			if [ -z "${_BRANCH}" ]
+			then
+				echo "❌ --worktree requires a branch name." >&2
+				exit 2
+			fi
+			_BRANCH_SET=1
+			;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			exit 2
+			;;
+		*)
+			if [ "${_REPO_SET}" -eq 1 ]
+			then
+				echo "❌ Unexpected argument: '$1'." >&2
+				exit 2
+			fi
+			_REPO="$1"
+			_REPO_SET=1
+			;;
+	esac
+	shift
+done
+
+# Any trailing args after "--" are treated as the repo (first only).
+if [ "${_REPO_SET}" -eq 0 ] && [ "$#" -gt 0 ]
+then
+	_REPO="$1"
+	_REPO_SET=1
+	shift
+	if [ "$#" -gt 0 ]
+	then
+		echo "❌ Unexpected argument: '$1'." >&2
+		exit 2
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the target directory.
+#
+# Two modes:
+#   * No repo argument -> "discover" mode: operate on the Git repository
+#     the current directory lives in, in place, at its actual on-disk
+#     location (`git rev-parse --show-toplevel`). This is the intuitive
+#     "refresh where I stand" gesture and deliberately does NOT re-derive a
+#     canonical path from the remote URL -- it acts on the exact checkout
+#     you are in (including a worktree). Not in a repo -> error.
+#   * A repo argument   -> "clone" mode: parse the URL into "<host>/<path>"
+#     and compute the destination under the projects directory, so the
+#     on-disk tree mirrors the remote URL.
+# ---------------------------------------------------------------------------
+if [ "${_REPO_SET}" -eq 0 ]
+then
+	# ---- Discover mode: act on the current repository in place. ----------
+	if ! _DEST="$(git rev-parse --show-toplevel 2>/dev/null)" || [ -z "${_DEST}" ]
+	then
+		echo "❌ No repository given and the current directory is not a Git repository." >&2
+		echo "   Usage: git get [--fetch-only|-F] [--worktree|-w <name>] [<repo>]" >&2
+		exit 2
+	fi
+	# In discover mode there is no clone URL; the target already exists.
+	_REPO=""
+	_REPO_NAME="$(basename "${_DEST}")"
+else
+	# ---- Clone mode: derive the on-disk path from the remote URL. --------
+	#
+	# Parse the URL into "<host>/<owner-path>/<repo>", stripping scheme,
+	# userinfo, port, and a trailing ".git". Supports:
+	#   - https://host[:port]/path/repo[.git]
+	#   - http://...  (normalised, cloned as-is)
+	#   - ssh://[user@]host[:port]/path/repo[.git]
+	#   - git+ssh://...
+	#   - [user@]host:path/repo[.git]   (SCP-style)
+	# The parsed path (host + full path, no ".git") is what the on-disk tree
+	# mirrors; the original URL is what we hand to `git clone`.
+	_REPO="${_REPO}"
+	_REL_PATH="$(printf '%s\n' "${_REPO}" | sed -E \
+		-e 's#^ssh://##' \
+		-e 's#^git\+ssh://##' \
+		-e 's#^https?://##' \
+		-e 's#^git://##' \
+		-e 's#^[^@/]*@##' \
+		-e 's#:([0-9]+)/#/#' \
+		-e 's#:#/#' \
+		-e 's#\.git/?$##' \
+		-e 's#/+$##')"
+
+	# The parse must yield at least "<host>/<repo>".
+	case "${_REL_PATH}" in
+		*/*) ;;
+		*)
+			echo "❌ Could not parse a host/path from '${_REPO}'." >&2
+			exit 1
+			;;
+	esac
+
+	# The repository (leaf) name, used for worktree-root nesting.
+	_REPO_NAME="$(basename "${_REL_PATH}")"
+	if [ -z "${_REPO_NAME}" ]
+	then
+		echo "❌ Could not determine a repository name from '${_REPO}'." >&2
+		exit 1
+	fi
+
+	# Resolve the projects directory (env > git config > ~/Projects) and
+	# expand a leading "~".
+	#
+	# Precedence: the environment variable wins if it is *set* (even to
+	# empty), then the git-config key if it *exists* (even if empty), then
+	# the built-in fallback. A value that is set/present but empty is a
+	# configuration error: we fail rather than silently falling back, since
+	# an empty projects directory would clone straight into "/".
+	if [ -n "${GIT_GET_PROJECTS_DIR+set}" ]
+	then
+		# Environment variable is set (possibly empty).
+		if [ -z "${GIT_GET_PROJECTS_DIR}" ]
+		then
+			echo "❌ \$GIT_GET_PROJECTS_DIR is set but empty; refusing to use an empty projects directory." >&2
+			exit 1
+		fi
+		_PROJECTS_DIR="${GIT_GET_PROJECTS_DIR}"
+	elif _PROJECTS_DIR="$(git config get.projectsDir 2>/dev/null)"
+	then
+		# git-config key exists (possibly empty).
+		if [ -z "${_PROJECTS_DIR}" ]
+		then
+			echo "❌ 'git config get.projectsDir' is set but empty; refusing to use an empty projects directory." >&2
+			exit 1
+		fi
+	else
+		# Neither source set: use the built-in fallback.
+		_PROJECTS_DIR="${HOME}/Projects"
+	fi
+
+	# Expand a leading "~" to the home directory.
+	case "${_PROJECTS_DIR}" in
+		"~") _PROJECTS_DIR="${HOME}" ;;
+		"~/"*) _PROJECTS_DIR="${HOME}/${_PROJECTS_DIR#~/}" ;;
+	esac
+
+	_DEST="${_PROJECTS_DIR}/${_REL_PATH}"
+fi
+
+# ---------------------------------------------------------------------------
+# Report whether a checkout is UNSAFE to update in place (stash + pull/
+# rebase), and why.
+#
+#   * Prints a short human-readable reason and returns 0 (success = "yes,
+#     blocked") when an operation is in progress or there are unmerged
+#     paths.
+#   * Prints nothing and returns 1 ("no, clear") when it is safe to update.
+#
+# "In progress" is detected from the sentinel files git writes under the
+# (possibly per-worktree) git dir -- resolved via `git rev-parse
+# --git-path` so it is correct inside a linked worktree, not just the main
+# checkout. Unmerged paths are detected from the two-letter XY status codes
+# that mean a conflict (U on either side, or AA/DD).
+# ---------------------------------------------------------------------------
+_update_blocker() {
+	_dir="$1"
+
+	# An in-progress operation leaves a sentinel in the git dir.
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path MERGE_HEAD 2>/dev/null)" ]
+	then
+		printf 'a merge is in progress'
+		return 0
+	fi
+	if [ -d "$(git -C "${_dir}" rev-parse --git-path rebase-merge 2>/dev/null)" ] \
+		|| [ -d "$(git -C "${_dir}" rev-parse --git-path rebase-apply 2>/dev/null)" ]
+	then
+		printf 'a rebase is in progress'
+		return 0
+	fi
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path CHERRY_PICK_HEAD 2>/dev/null)" ]
+	then
+		printf 'a cherry-pick is in progress'
+		return 0
+	fi
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path REVERT_HEAD 2>/dev/null)" ]
+	then
+		printf 'a revert is in progress'
+		return 0
+	fi
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path BISECT_LOG 2>/dev/null)" ]
+	then
+		printf 'a bisect is in progress'
+		return 0
+	fi
+
+	# Unmerged paths: the porcelain XY code is one of the conflict shapes
+	# (DD, AU, UD, UA, DU, AA, UU). Any line whose first two columns contain
+	# a "U", or is "AA"/"DD", is an unresolved conflict.
+	if git -C "${_dir}" status --porcelain 2>/dev/null \
+		| grep -Eq '^(DD|AU|UD|UA|DU|AA|UU) '
+	then
+		printf 'there are unmerged (conflicted) paths'
+		return 0
+	fi
+
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# Update an existing checkout. In --fetch-only mode this just fetches; the
+# full mode fetches, stashes local changes, pulls/rebases onto the default
+# branch, then restores the stash. Operates via `git -C` so it is worktree-
+# and cwd-independent.
+# ---------------------------------------------------------------------------
+update_repo() {
+	_dir="$1"
+
+	echo "🔄 Fetching in '${_dir}'..."
+	git -C "${_dir}" fetch --prune
+
+	if [ "${_FETCH_ONLY}" -eq 1 ]
+	then
+		echo "✅ Fetch complete (fetch-only)."
+		return 0
+	fi
+
+	# Refuse to touch the working tree when it is not safe to stash. Two
+	# situations make the stash/pull/rebase dance impossible or destructive:
+	#
+	#   * An operation is in progress (merge, rebase, cherry-pick, revert,
+	#     or bisect). Rebasing on top of that would clobber the in-flight
+	#     state.
+	#   * There are unmerged (conflicted) paths. `git stash` cannot write a
+	#     conflicted index -- it prints "error: could not write index" and,
+	#     depending on the git version, may even exit 0, so the failure can
+	#     slip past `set -e` and the update would blunder on against a dirty
+	#     index. (This is the bug that surfaced as a cryptic stash error.)
+	#
+	# In both cases we skip the working-tree update but return success: the
+	# fetch above already refreshed the remote-tracking refs, and callers
+	# (e.g. `git work start`) should still open the checkout so you can
+	# finish resolving the conflict / operation by hand.
+	if _blocker="$(_update_blocker "${_dir}")"
+	then
+		echo "⚠️  Skipping the working-tree update: ${_blocker}." >&2
+		echo "   Fetched remote refs only; resolve it, then re-run 'git get' to pull/rebase." >&2
+		echo "✅ Fetch complete (working-tree update skipped)."
+		return 0
+	fi
+
+	# Stash any local changes (including untracked) so the pull/rebase has
+	# a clean tree to work with.
+	_stashed=0
+	if [ -n "$(git -C "${_dir}" status --porcelain)" ]
+	then
+		echo "📦 Stashing local changes..."
+		git -C "${_dir}" stash push --include-untracked \
+			--message "git-get on $(date)" >/dev/null
+		_stashed=1
+	fi
+
+	# Resolve the default branch and the current branch.
+	_default_branch="$(git -C "${_dir}" symbolic-ref --quiet --short \
+		refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+	[ -z "${_default_branch}" ] && _default_branch="$(git -C "${_dir}" \
+		rev-parse --abbrev-ref HEAD 2>/dev/null)"
+	_current_branch="$(git -C "${_dir}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+
+	if [ "${_current_branch}" = "${_default_branch}" ]
+	then
+		echo "🔀 Pulling '${_current_branch}'..."
+		git -C "${_dir}" pull --ff-only
+	else
+		echo "🔀 Rebasing '${_current_branch}' onto 'origin/${_default_branch}'..."
+		git -C "${_dir}" pull --ff-only || true
+		git -C "${_dir}" rebase "origin/${_default_branch}"
+	fi
+
+	# Restore any stashed changes.
+	if [ "${_stashed}" -eq 1 ]
+	then
+		echo "📦 Re-applying stashed changes..."
+		git -C "${_dir}" stash pop
+	fi
+
+	echo "✅ Update complete."
+}
+
+# ---------------------------------------------------------------------------
+# Clone (default branch) or update the main checkout at _DEST.
+# ---------------------------------------------------------------------------
+if [ -e "${_DEST}" ]
+then
+	if ! git -C "${_DEST}" rev-parse --git-dir >/dev/null 2>&1
+	then
+		echo "❌ '${_DEST}' exists but is not a Git repository." >&2
+		exit 1
+	fi
+	echo "📁 Repository already present at '${_DEST}'."
+	update_repo "${_DEST}"
+else
+	echo "⬇️  Cloning '${_REPO}' into '${_DEST}'..."
+	mkdir -p "$(dirname "${_DEST}")"
+	git clone "${_REPO}" "${_DEST}"
+	echo "✅ Cloned to '${_DEST}'."
+fi
+
+# ---------------------------------------------------------------------------
+# Optional: add a worktree for the named branch.
+# ---------------------------------------------------------------------------
+if [ "${_BRANCH_SET}" -eq 1 ]
+then
+	_WORKTREE_ROOT="${GIT_WORKTREE_ROOT:-${_DEST}/.worktree-branches}"
+
+	# Keep the in-repo worktree dir out of git when it lives inside the
+	# repository, mirroring git-worktree-checkout-branches.
+	case "${_WORKTREE_ROOT}" in
+		"${_DEST}"/*)
+			_IGNORE_ENTRY="$(echo "${_WORKTREE_ROOT#"${_DEST}"/}" | sed 's#/*$#/#')"
+			_EXCLUDE_FILE="$(git -C "${_DEST}" rev-parse --git-path info/exclude)"
+			if ! git -C "${_DEST}" check-ignore -q "${_WORKTREE_ROOT}" 2>/dev/null
+			then
+				echo "🙈 Adding '${_IGNORE_ENTRY}' to ${_EXCLUDE_FILE}."
+				mkdir -p "$(dirname "${_EXCLUDE_FILE}")"
+				echo "${_IGNORE_ENTRY}" >> "${_EXCLUDE_FILE}"
+			fi
+			;;
+	esac
+
+	mkdir -p "${_WORKTREE_ROOT}"
+	_WORKTREE_PATH="${_WORKTREE_ROOT}/$(echo "${_BRANCH}" | tr '/' '-')"
+
+	if git -C "${_DEST}" worktree list --porcelain \
+		| grep -q "branch refs/heads/${_BRANCH}$"
+	then
+		echo "⏭️  Branch '${_BRANCH}' already has a worktree, leaving as-is."
+	elif [ -e "${_WORKTREE_PATH}" ]
+	then
+		echo "⏭️  Path '${_WORKTREE_PATH}' exists, leaving as-is."
+	elif git -C "${_DEST}" show-ref --quiet --verify "refs/heads/${_BRANCH}"
+	then
+		echo "➕ Adding worktree for existing branch '${_BRANCH}'."
+		git -C "${_DEST}" worktree add "${_WORKTREE_PATH}" "${_BRANCH}"
+	elif git -C "${_DEST}" show-ref --quiet --verify "refs/remotes/origin/${_BRANCH}"
+	then
+		echo "➕ Adding worktree for new branch '${_BRANCH}' (tracking origin/${_BRANCH})."
+		git -C "${_DEST}" worktree add -b "${_BRANCH}" \
+			"${_WORKTREE_PATH}" "origin/${_BRANCH}"
+	else
+		echo "❌ Branch '${_BRANCH}' not found locally or on 'origin'." >&2
+		exit 1
+	fi
+
+	# Resolve the worktree's actual path from git (it may already have
+	# existed at a different location than the computed default) so the
+	# reported result directory is always correct.
+	_RESULT="$(git -C "${_DEST}" worktree list --porcelain \
+		| awk -v b="refs/heads/${_BRANCH}" '
+			/^worktree /  { p = substr($0, 10) }
+			$0 == "branch " b { print p; exit }')"
+	[ -z "${_RESULT}" ] && _RESULT="${_WORKTREE_PATH}"
+else
+	# No worktree requested: the result is the main checkout.
+	_RESULT="${_DEST}"
+fi
+
+# The final line is the result directory: the worktree path when
+# --worktree was given, otherwise the main checkout. Sister commands
+# (e.g. git-edit) read this last line to locate the project.
+echo "📂 ${_RESULT}"

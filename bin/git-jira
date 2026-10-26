@@ -1,0 +1,160 @@
+#!/bin/sh
+
+## Work with the current branch's Jira issue.
+##
+## Usage: git jira <subcommand> [args]
+##
+## Derives a Jira issue id from a branch name and acts on it via the
+## Atlassian CLI (`acli`). The id must START the branch name, or the final
+## path segment of a folder-structured name:
+##
+##     IRM-216-print-agent-communication-api  -> IRM-216
+##     feature/IRM-216-print-agent-comms       -> IRM-216
+##     bugfix/irm-157                           -> irm-157
+##
+## Subcommands:
+##   open [branch]   Open the issue in a browser:
+##                     acli jira workitem view <JIRA-ID> --web
+##   id [branch]     Print the extracted Jira id and exit (open nothing).
+##   help            Show this help (also --help / -h).
+##
+## By default the current branch (`git rev-parse --abbrev-ref HEAD`) is
+## used; pass a branch name to any subcommand to override it.
+##
+## Jira id pattern (configurable):
+##   The id is matched by a POSIX extended regular expression, anchored to
+##   the start of the branch name. The default is:
+##
+##       ^[A-Za-z][A-Za-z0-9]*-[0-9]+
+##
+##   which matches a leading letter, then any letters/digits, a hyphen, and
+##   one or more digits (e.g. `IRM-216`, `PCPP-505`). Override it, highest
+##   precedence first:
+##
+##     | Source                   | Notes                        |
+##     | ------------------------ | ---------------------------- |
+##     | $GIT_JIRA_PATTERN        | Per-invocation env override  |
+##     | git config jira.pattern  | Persistent default           |
+##     | ^[A-Za-z][A-Za-z0-9]*-[0-9]+ | Built-in fallback        |
+##
+##   An explicitly empty value for either the variable or the config key is
+##   treated as an error rather than falling back.
+##
+## Requires the `acli` command (Atlassian CLI) on $PATH for `open`.
+
+set -e
+
+_DEFAULT_PATTERN='^[A-Za-z][A-Za-z0-9]*-[0-9]+'
+
+_usage() {
+	echo "Usage: git jira <subcommand> [args]" >&2
+	echo "   Subcommands: open [branch], id [branch], help" >&2
+}
+
+_show_help() {
+	sed -n 's/^## \{0,1\}//p' "$0"
+}
+
+# Resolve the Jira id pattern, highest precedence first: environment
+# variable, then git config, then the built-in default. An explicitly empty
+# override is an error -- an empty pattern would match everything.
+_resolve_pattern() {
+	if [ -n "${GIT_JIRA_PATTERN+set}" ]; then
+		if [ -z "${GIT_JIRA_PATTERN}" ]; then
+			echo "❌ \$GIT_JIRA_PATTERN is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${GIT_JIRA_PATTERN}"
+		return 0
+	fi
+	if _cfg="$(git config jira.pattern 2>/dev/null)"; then
+		if [ -z "${_cfg}" ]; then
+			echo "❌ git config 'jira.pattern' is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${_cfg}"
+		return 0
+	fi
+	printf '%s' "${_DEFAULT_PATTERN}"
+}
+
+# Echo the Jira id for a branch (given, or the current branch), or fail.
+_jira_id_for() {
+	_branch="$1"
+	if [ -z "${_branch}" ]; then
+		if ! _branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || [ -z "${_branch}" ]
+		then
+			echo "❌ Could not determine the current branch." >&2
+			echo "   Are you inside a Git repository with a checked-out branch?" >&2
+			exit 1
+		fi
+	fi
+
+	_pattern="$(_resolve_pattern)"
+
+	# Branch names are often folder-structured, e.g. `feature/irm-157`. The
+	# id sits at the start of the last path component, not the whole name,
+	# so match against the segment after the final `/`. A branch with no
+	# slash is unchanged.
+	_leaf="${_branch##*/}"
+
+	_id="$(printf '%s' "${_leaf}" | grep -Eo "${_pattern}" | head -n 1)"
+	if [ -z "${_id}" ]; then
+		echo "❌ '${_branch}' is not prefixed with a Jira id." >&2
+		echo "   Expected the branch (or its final path segment) to start with" >&2
+		echo "   a match for: ${_pattern}" >&2
+		echo "   e.g. IRM-216-print-agent-communication-api or feature/IRM-216 -> IRM-216" >&2
+		exit 1
+	fi
+	printf '%s\n' "${_id}"
+}
+
+# Reject any extra positional argument beyond the optional branch name.
+_at_most_one_branch() {
+	if [ "$#" -gt 1 ]; then
+		shift
+		echo "❌ Unexpected argument: '$1'." >&2
+		_usage
+		exit 2
+	fi
+}
+
+# --- Dispatch ---
+
+if [ "$#" -eq 0 ]; then
+	_usage
+	exit 2
+fi
+
+_SUB="$1"
+shift
+
+case "${_SUB}" in
+	-h|--help|help)
+		_show_help
+		exit 0
+		;;
+	open)
+		_at_most_one_branch "$@"
+		_ID="$(_jira_id_for "${1-}")"
+		if ! command -v acli >/dev/null 2>&1; then
+			echo "❌ Could not find 'acli' (Atlassian CLI) on your PATH." >&2
+			exit 1
+		fi
+		acli jira workitem view "${_ID}" --web
+		;;
+	id)
+		_at_most_one_branch "$@"
+		_jira_id_for "${1-}"
+		;;
+	-*)
+		echo "❌ Unknown option: '${_SUB}'." >&2
+		_usage
+		exit 2
+		;;
+	*)
+		echo "❌ Unknown subcommand: '${_SUB}'." >&2
+		_usage
+		exit 2
+		;;
+esac

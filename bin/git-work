@@ -1,0 +1,100 @@
+#!/bin/sh
+
+## Drive a unit of work from start to merge request.
+##
+## Usage: git work <subcommand> [args]
+##
+## A thin dispatcher over the work-* sibling commands. Each subcommand is a
+## separate `git work-<name>` executable (so it also works standalone); this
+## entry point just routes `git work <name> ...` to `git work-<name> ...`
+## and forwards every remaining argument untouched.
+##
+## Subcommands:
+##   start [opts]    Pick a worktree/branch (or make one) with fzf and open
+##                   it in your editor. The daily-driver entry point.
+##                   See `git work start --help`.
+##   commit [opts]   Guide staging (via `git add -p`) and hand the staged
+##                   change to your AI CLI tool to commit, then optionally
+##                   push/publish the branch. See `git work commit --help`.
+##   end [opts]      Run `commit` first, then (if the branch was pushed)
+##                   have the AI CLI tool create/update the branch's merge
+##                   request. See `git work end --help`.
+##   help            Show this help (also --help / -h).
+##
+## Each subcommand has its own `--help`; run e.g. `git work commit --help`
+## for its options and behaviour.
+##
+## AI CLI tool (used by `commit` and `end`), highest precedence first:
+##     $AI_CLI_TOOL            (environment override, e.g. "kiro-cli --v3")
+##     git config work.aiTool  (persistent default)
+## There is no built-in fallback: `commit`/`end` fail if neither is set.
+##
+## The prompts handed to that tool are configurable too (per-invocation
+## flag, then git config, then a built-in default):
+##     git config work.aiCommitPrompt  (for `commit`; --prompt overrides)
+##     git config work.aiMrPrompt      (for `end`; --mr-prompt overrides)
+
+set -e
+
+_usage() {
+	echo "Usage: git work <subcommand> [args]" >&2
+	echo "   Subcommands: start, commit, end, help" >&2
+}
+
+_show_help() {
+	sed -n 's/^## \{0,1\}//p' "$0"
+}
+
+# ---------------------------------------------------------------------------
+# Resolve a sibling `git-work-<name>` next to this script so dispatch works
+# regardless of install location, falling back to a PATH-resolved form.
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+_resolve_sibling() {
+	# $1: basename of the sibling command.
+	_sib="${_SCRIPT_DIR}/$1"
+	if [ -x "${_sib}" ]
+	then
+		printf '%s\n' "${_sib}"
+	elif command -v "$1" >/dev/null 2>&1
+	then
+		printf '%s\n' "$1"
+	else
+		echo "❌ Could not find the sibling '$1' command." >&2
+		return 1
+	fi
+}
+
+# --- Dispatch ---
+
+if [ "$#" -eq 0 ]
+then
+	echo "❌ A subcommand is required." >&2
+	_usage
+	exit 2
+fi
+
+_SUB="$1"
+shift
+
+case "${_SUB}" in
+	-h|--help|help)
+		_show_help
+		exit 0
+		;;
+	start|commit|end)
+		_target="$(_resolve_sibling "git-work-${_SUB}")" || exit 1
+		exec "${_target}" "$@"
+		;;
+	-*)
+		echo "❌ Unknown option: '${_SUB}'." >&2
+		_usage
+		exit 2
+		;;
+	*)
+		echo "❌ Unknown subcommand: '${_SUB}'." >&2
+		_usage
+		exit 2
+		;;
+esac

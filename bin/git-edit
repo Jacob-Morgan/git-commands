@@ -1,0 +1,216 @@
+#!/bin/sh
+
+## Clone/update a repository with `git get`, then open it in your editor.
+##
+## A thin sister command to `git get`: it forwards all of its arguments to
+## `git get` (so cloning, updating, and the --worktree / --fetch-only
+## options all behave identically), then opens the resulting project
+## directory in your configured editor.
+##
+## When --worktree <name> is given, `git get` reports the worktree path as
+## its result, so the editor opens the worktree's working directory -- not
+## the default-branch checkout.
+##
+## With NO arguments, `git edit` refreshes the repository the current
+## directory lives in -- in place, via `git get` -- and then opens it. This
+## is the default so that opening someone else's work for review always
+## lands on up-to-date code. The refresh stashes and restores any local
+## changes (it will not discard them), but it may rebase work in progress.
+##
+## Pass --no-update / -n (on its own) to skip the refresh and just open the
+## current repository as it sits on disk -- the escape hatch for opening a
+## repo mid-change without touching the working tree. --no-update is only
+## valid with no other arguments; it cannot combine with a repo URL or any
+## `git get` option. Not in a repo (with no repo argument) -> fail.
+##
+## Usage: git edit [--no-update|-n] [--fetch-only|-F] [--worktree|-w <name>]
+##                 [<repo>]
+##
+##   Apart from --no-update (git-edit's own), arguments are identical to
+##   `git get`; see `git get --help`.
+##
+## Editor resolution (highest precedence first):
+##     $VISUAL                   (GUI/full-screen editor, per invocation)
+##     `git `   (persistent project opener, e.g. "code")
+##     $EDITOR                   (terminal editor, per invocation)
+##     `git config core.editor`  (git's commit-message editor)
+##
+## The order deliberately prefers a visual/project editor: $VISUAL and the
+## dedicated `get.visual` key come before $EDITOR / core.editor, which are
+## usually a terminal editor (vim, nano) meant for commit messages rather
+## than opening a whole project. Set a project opener with:
+##     git config --global get.visual code
+##
+## If none of these is set, the command fails with an error rather than
+## guessing an editor.
+##
+## Example ~/.gitconfig (both keys this command family understands):
+##     [get]
+##         projectsDir = ~/Projects   ; where `git get` clones (see git-get)
+##         visual = code              ; project opener for `git edit`
+##     [core]
+##         editor = vim               ; git's commit-message editor (fallback)
+
+set -e
+
+# Resolve the sibling `git-get` next to this script so it works regardless
+# of install location / current directory, falling back to the PATH-
+# resolved git subcommand.
+_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+_GIT_GET="${_SCRIPT_DIR}/git-get"
+if [ ! -x "${_GIT_GET}" ]
+then
+	# Not alongside us: fall back to a PATH-resolvable `git-get`. (We can't
+	# probe with `git get --help`, because git turns that into a man-page
+	# lookup that fails even when the subcommand is installed.)
+	if command -v git-get >/dev/null 2>&1
+	then
+		_GIT_GET="git-get"
+	else
+		echo "❌ Could not find the sibling 'git-get' command." >&2
+		exit 1
+	fi
+fi
+
+# Allow `git edit --help` / `-h` to surface this command's own help rather
+# than forwarding to `git get`.
+case "$1" in
+	-h|--help)
+		sed -n 's/^## \{0,1\}//p' "$0"
+		exit 0
+		;;
+esac
+
+# Extract the git-edit-only option --no-update / -n, which is NOT a `git get`
+# flag. It is meaningful only in the no-other-arguments "discover" case
+# (open the current repo without refreshing first); giving it alongside a
+# repo URL or any `git get` option is an error. Remaining args are forwarded
+# to `git get` verbatim.
+_NO_UPDATE=0
+_ARGS_WITHOUT_NO_UPDATE=0
+for _arg in "$@"
+do
+	case "${_arg}" in
+		-n|--no-update) _NO_UPDATE=1 ;;
+		*) _ARGS_WITHOUT_NO_UPDATE=$((_ARGS_WITHOUT_NO_UPDATE + 1)) ;;
+	esac
+done
+
+if [ "${_NO_UPDATE}" -eq 1 ] && [ "${_ARGS_WITHOUT_NO_UPDATE}" -gt 0 ]
+then
+	echo "❌ --no-update / -n may only be used on its own (opening the current" >&2
+	echo "   repository in place); it is not valid with a repository argument" >&2
+	echo "   or any 'git get' option." >&2
+	exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the editor BEFORE doing any clone/update work, so a missing
+# editor fails fast instead of after a potentially slow clone.
+#   1. $VISUAL                  (GUI/full-screen editor)
+#   2. git config get.visual    (dedicated project opener)
+#   3. $EDITOR                  (terminal editor)
+#   4. git config core.editor   (git's commit-message editor)
+# ---------------------------------------------------------------------------
+_EDITOR=""
+if [ -n "${VISUAL}" ]
+then
+	_EDITOR="${VISUAL}"
+elif _EDITOR="$(git config get.visual 2>/dev/null)" && [ -n "${_EDITOR}" ]
+then
+	: # use get.visual
+elif [ -n "${EDITOR}" ]
+then
+	_EDITOR="${EDITOR}"
+else
+	_EDITOR="$(git config core.editor 2>/dev/null || true)"
+fi
+
+if [ -z "${_EDITOR}" ]
+then
+	echo "❌ No editor configured." >&2
+	echo "   Set \$VISUAL, 'git config get.visual', \$EDITOR, or 'git config core.editor'." >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# --no-update: open the repository the current directory lives in, in place,
+# WITHOUT refreshing it (no `git get`, so no fetch / stash / pull / rebase).
+# The escape hatch for opening a repo mid-change without disturbing the
+# working tree. Only reached when it was the sole argument (enforced above).
+# ---------------------------------------------------------------------------
+if [ "${_NO_UPDATE}" -eq 1 ]
+then
+	if ! _DIR="$(git rev-parse --show-toplevel 2>/dev/null)" || [ -z "${_DIR}" ]
+	then
+		echo "❌ --no-update given but the current directory is not a Git repository." >&2
+		echo "   Usage: git edit [--no-update|-n] [--fetch-only|-F] [--worktree|-w <name>] [<repo>]" >&2
+		exit 2
+	fi
+	echo "✏️  Opening '${_DIR}' with: ${_EDITOR} (no refresh)"
+	cd "${_DIR}"
+	# shellcheck disable=SC2086
+	exec ${_EDITOR} .
+fi
+
+# ---------------------------------------------------------------------------
+# Otherwise run `git get`, forwarding all arguments, then open its result.
+#
+# With no arguments this refreshes the current repository in place (git get's
+# own discover mode) -- the default, so a review always opens up-to-date
+# code. With a repo URL / --worktree / --fetch-only it clones or updates as
+# usual. Its progress is streamed to the terminal; we also capture stdout so
+# we can read the final "📂 <path>" line -- the project (or worktree)
+# directory to open.
+# ---------------------------------------------------------------------------
+_CAPTURE="$(mktemp "${TMPDIR:-/tmp}/git-edit.XXXXXX")"
+
+# Stream to the terminal and capture simultaneously. stderr passes straight
+# through so error messages remain visible.
+#
+# A plain "git get | tee" pipeline would mask git-get's exit status behind
+# tee's (always 0), so `set -e` would not catch a failed clone/update and we
+# would wrongly proceed to open an editor. POSIX sh has no PIPESTATUS, so we
+# stash git-get's real status in a sentinel file written inside the subshell.
+_STATUS_FILE="$(mktemp "${TMPDIR:-/tmp}/git-edit-status.XXXXXX")"
+trap 'rm -f "${_CAPTURE}" "${_STATUS_FILE}"' EXIT INT TERM
+
+# NOTE: `set -e` is active, so the status-recording command must not be
+# the brace group's *first* command (a non-zero git-get would abort the
+# group before the status is written). Capturing into a variable first,
+# guarded with `|| _st=$?`, keeps the write unconditional.
+{ _st=0; "${_GIT_GET}" "$@" || _st=$?; echo "${_st}" > "${_STATUS_FILE}"; } \
+	| tee "${_CAPTURE}"
+
+_GET_STATUS="$(cat "${_STATUS_FILE}" 2>/dev/null || echo 1)"
+[ -z "${_GET_STATUS}" ] && _GET_STATUS=1
+if [ "${_GET_STATUS}" -ne 0 ]
+then
+	# git-get already printed a diagnostic to stderr; just propagate.
+	exit "${_GET_STATUS}"
+fi
+
+# Pull the final "📂 "-prefixed line (the result directory). Using the last
+# such line is robust even if future output adds more of them.
+_DIR="$(grep '^📂 ' "${_CAPTURE}" | tail -n 1 | sed 's/^📂 //')"
+
+if [ -z "${_DIR}" ]
+then
+	echo "❌ Could not determine the project directory from 'git get' output." >&2
+	exit 1
+fi
+
+if [ ! -d "${_DIR}" ]
+then
+	echo "❌ Project directory '${_DIR}' does not exist." >&2
+	exit 1
+fi
+
+echo "✏️  Opening '${_DIR}' with: ${_EDITOR}"
+
+# Launch the editor in the project directory. The editor command may itself
+# contain arguments (e.g. "code --wait"), so it is intentionally left
+# unquoted for word-splitting, matching how git itself invokes core.editor.
+cd "${_DIR}"
+# shellcheck disable=SC2086
+exec ${_EDITOR} .

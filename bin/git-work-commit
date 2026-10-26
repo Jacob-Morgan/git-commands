@@ -1,0 +1,357 @@
+#!/bin/sh
+
+## Stage the right changes, then hand the commit to your AI CLI tool.
+##
+## Usage: git work commit [--ci-skip|--ci] [--no-push] [--prompt <text>]
+##
+## Reached as `git work commit`, or directly as `git work-commit`.
+##
+## Mirrors a manual review-stage-commit-push loop in one place:
+##   (1) Stage: `git add -A` stages everything (tracked edits, deletions,
+##       and untracked files), then an interactive loop lets you UNSTAGE
+##       anything you don't want in this commit -- the "stage all, then
+##       drop what I don't want" workflow. Nothing is committed until you
+##       confirm.
+##   (2) Commit: the staged change is handed to your AI CLI tool, which
+##       performs the actual `git commit` (writing the message itself).
+##   (3) Push: you're asked, per push, whether this one needs a CI build --
+##       push with CI, push skipping CI (`-o ci.skip`), or don't push. A
+##       first push on a new branch sets upstream (`-u origin <branch>`).
+##
+## Options:
+##   --ci-skip        Push with `-o ci.skip` without asking (skip CI).
+##   --ci             Push normally without asking (run CI).
+##   --no-push        Stage and commit only; never push.
+##   --prompt <text>  Override the commit prompt handed to the AI CLI tool.
+##   -h, --help       Show this help.
+##
+## Commit prompt, highest precedence first:
+##     --prompt <text>                 (this invocation)
+##     git config work.aiCommitPrompt  (persistent default)
+##     commit all staged changes, ignore untracked files  (built-in)
+## A configured-but-empty work.aiCommitPrompt is an error, not a fallback.
+##
+## With none of --ci-skip / --ci / --no-push, the push step is interactive:
+##   🚀 Push to origin/<branch>?  [c] with CI  [s] skip CI  [n] don't push
+##
+## AI CLI tool, highest precedence first:
+##     $AI_CLI_TOOL            (environment override, e.g. "kiro-cli --v3")
+##     git config work.aiTool  (persistent default)
+## There is no built-in fallback: this command fails if neither is set. The
+## resolved value is run with the commit prompt as a single argument, e.g.
+##     kiro-cli --v3 "commit all staged changes, ignore untracked files"
+##
+## AI CLI tool contract (the developer's responsibility, NOT enforced here):
+##   This command hands the prompt to the tool, waits for it to exit, and
+##   branches on its exit status -- nothing more. It does not inject any
+##   flag or assume any particular tool. For the handoff to do what it
+##   says, the configured command must satisfy three things, which you
+##   bake into $AI_CLI_TOOL / work.aiTool yourself:
+##     1. Single-shot: run ONE request from the prompt and then TERMINATE.
+##        A tool that drops into an interactive REPL will hang this command
+##        (it waits for the process to exit). Add whatever one-shot flag
+##        your tool uses (e.g. --no-interactive, -p/--print, a "run"/"chat"
+##        subcommand) to the configured string.
+##     2. Agent mode (can ACT, not just chat): the tool must actually
+##        PERFORM the git commit from the prompt, not merely print a
+##        suggested command or a chat reply. A plain chat turn typically
+##        answers in text and runs nothing -- it would exit 0 having
+##        committed nothing, so this command would look like it succeeded
+##        while no commit was made. Enable whatever "execute tools" / agent
+##        / "trust tools" mode your tool provides.
+##     3. Prompt shape: the prompt is passed as the single FINAL positional
+##        argument (tool <your flags> "<prompt>"). If your tool wants the
+##        prompt via a flag or on stdin instead, wrap it in a small script
+##        and point work.aiTool at that wrapper.
+##   As a safety net for (2), this command warns (does not fail) if changes
+##   are still staged after the tool returns -- a sign it didn't commit.
+##
+## Exit status:
+##   0  committed (and pushed, unless you declined / --no-push)
+##   1  a runtime failure (not in a repo, nothing staged, AI tool missing,
+##      commit or push failed)
+##   2  a usage error (unknown option, missing value)
+
+set -e
+
+_DEFAULT_PROMPT='commit all staged changes, ignore untracked files'
+
+_usage() {
+	echo "Usage: git work commit [--ci-skip|--ci] [--no-push] [--prompt <text>]" >&2
+}
+
+# Resolve the commit prompt when --prompt wasn't given: git config
+# work.aiCommitPrompt, then the built-in default. A configured-but-empty
+# value is an error (an empty prompt gives the AI tool nothing to act on)
+# rather than falling through to the default.
+_resolve_commit_prompt() {
+	if _cfg="$(git config work.aiCommitPrompt 2>/dev/null)"; then
+		if [ -z "${_cfg}" ]; then
+			echo "❌ git config 'work.aiCommitPrompt' is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${_cfg}"
+		return 0
+	fi
+	printf '%s' "${_DEFAULT_PROMPT}"
+}
+
+_show_help() {
+	sed -n 's/^## \{0,1\}//p' "$0"
+}
+
+# ---------------------------------------------------------------------------
+# Resolve the AI CLI tool: $AI_CLI_TOOL, then `git config work.aiTool`. An
+# explicitly empty value for either is an error (an empty command can't
+# commit) rather than falling through. No built-in default -- there is no
+# sensible guess for "which agent commits my work".
+#
+# The value may carry arguments (e.g. "kiro-cli --v3"); it is run through
+# the shell's word-splitting (unquoted expansion) so those flags are passed
+# as separate arguments, with the prompt appended as one final argument.
+# ---------------------------------------------------------------------------
+_resolve_ai_tool() {
+	if [ -n "${AI_CLI_TOOL+set}" ]; then
+		if [ -z "${AI_CLI_TOOL}" ]; then
+			echo "❌ \$AI_CLI_TOOL is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${AI_CLI_TOOL}"
+		return 0
+	fi
+	if _cfg="$(git config work.aiTool 2>/dev/null)"; then
+		if [ -z "${_cfg}" ]; then
+			echo "❌ git config 'work.aiTool' is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${_cfg}"
+		return 0
+	fi
+	echo "❌ No AI CLI tool configured for 'git work commit'." >&2
+	echo "   Set \$AI_CLI_TOOL (e.g. 'kiro-cli --v3') or run:" >&2
+	echo "     git config work.aiTool 'kiro-cli --v3'" >&2
+	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
+# Push mode: "ask" (default, interactive), "skip" (-o ci.skip), "ci" (plain
+# push), or "none" (don't push).
+_PUSH_MODE="ask"
+_PROMPT=""
+_PROMPT_SET=0
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		--ci-skip)
+			_PUSH_MODE="skip"
+			;;
+		--ci)
+			_PUSH_MODE="ci"
+			;;
+		--no-push)
+			_PUSH_MODE="none"
+			;;
+		--prompt)
+			if [ "$#" -lt 2 ]; then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_PROMPT="$2"
+			_PROMPT_SET=1
+			shift
+			;;
+		--prompt=*)
+			_PROMPT="${1#--prompt=}"
+			_PROMPT_SET=1
+			;;
+		-h|--help)
+			_show_help
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			_usage
+			exit 2
+			;;
+		*)
+			echo "❌ Unexpected argument: '$1'." >&2
+			_usage
+			exit 2
+			;;
+	esac
+	shift
+done
+
+if [ "$#" -gt 0 ]; then
+	echo "❌ Unexpected argument: '$1'." >&2
+	_usage
+	exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Must be inside a repository with a checked-out branch.
+# ---------------------------------------------------------------------------
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	echo "❌ Not inside a Git repository." >&2
+	exit 1
+fi
+
+# Use symbolic-ref (not `rev-parse --abbrev-ref HEAD`) to read the branch:
+# it succeeds on an unborn branch (a fresh branch with no commits yet, where
+# rev-parse would print "HEAD") and fails only on a genuine detached HEAD.
+if ! _BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || [ -z "${_BRANCH}" ]; then
+	echo "❌ No branch is checked out (detached HEAD?)." >&2
+	exit 1
+fi
+
+# Resolve the AI tool up front so a missing one fails before we stage.
+_AI_TOOL="$(_resolve_ai_tool)"
+
+# Resolve the commit prompt: an explicit --prompt wins; otherwise fall back
+# to git config work.aiCommitPrompt, then the built-in default.
+if [ "${_PROMPT_SET}" -eq 0 ]; then
+	_PROMPT="$(_resolve_commit_prompt)"
+fi
+
+# ---------------------------------------------------------------------------
+# (1) Stage: add everything, then interactively unstage what you don't want.
+# ---------------------------------------------------------------------------
+echo "📋 Current status:" >&2
+git -c color.status=always status --short >&2 || true
+echo >&2
+
+echo "➕ Staging all changes (git add -A)..." >&2
+git add -A
+
+# Interactive unstage loop. Show what's staged; let the user remove entries
+# until they're happy. Empty input accepts the current staging.
+while :
+do
+	# Staged paths, one per line. `diff --cached --name-only` lists the
+	# index against HEAD, or against the empty tree before the first commit
+	# (when there is no HEAD), so it works in both cases.
+	_staged="$(git diff --cached --name-only)"
+
+	if [ -z "${_staged}" ]; then
+		echo "❌ Nothing is staged to commit." >&2
+		exit 1
+	fi
+
+	echo "✅ Staged for commit:" >&2
+	printf '%s\n' "${_staged}" | sed 's/^/   /' >&2
+	echo >&2
+	printf '✂️  Unstage a path? Enter a path to unstage, or press Enter to continue: ' >&2
+	if ! read -r _unstage; then
+		# EOF (e.g. non-interactive stdin): accept the current staging.
+		echo >&2
+		break
+	fi
+
+	[ -z "${_unstage}" ] && break
+
+	if ! printf '%s\n' "${_staged}" | grep -qxF "${_unstage}"; then
+		echo "⚠️  '${_unstage}' is not in the staged list; ignoring." >&2
+		continue
+	fi
+
+	# Restore the path to its HEAD state in the index (unstage), supporting
+	# the pre-first-commit case where there is no HEAD to restore from.
+	if git rev-parse --verify --quiet HEAD >/dev/null 2>&1; then
+		git restore --staged -- "${_unstage}"
+	else
+		git rm --cached --quiet -- "${_unstage}"
+	fi
+	echo "↩️  Unstaged '${_unstage}'." >&2
+done
+
+# Final confirmation before handing off to the AI tool to commit.
+printf '📝 Commit the staged changes with your AI CLI tool? [Y/n] ' >&2
+read -r _ans || _ans=""
+case "${_ans}" in
+	n|N|no|No|NO)
+		echo "🛑 Aborted before commit; your staging is left as-is." >&2
+		exit 1
+		;;
+esac
+
+# ---------------------------------------------------------------------------
+# (2) Commit: hand off to the AI CLI tool. The value may carry its own args
+# (e.g. "kiro-cli --v3"), so leave it unquoted for word-splitting; the
+# prompt is a single final argument.
+#
+# This is a synchronous foreground call: we block until the tool exits and
+# then branch on its status. We do NOT add a single-shot flag or assume the
+# tool runs in agent mode -- that's the developer's job via the configured
+# command (see the "AI CLI tool contract" in the header comment). A tool
+# that opens an interactive REPL will hold this call until that session
+# ends; a chat-only tool may exit 0 without committing anything (the staged-
+# changes check below is the safety net for that case).
+# ---------------------------------------------------------------------------
+echo "🤖 Handing the commit to: ${_AI_TOOL}" >&2
+# shellcheck disable=SC2086
+if ! ${_AI_TOOL} "${_PROMPT}"; then
+	echo "❌ The AI CLI tool exited non-zero; commit not confirmed." >&2
+	exit 1
+fi
+
+# Verify a commit actually landed: the index should now be clean of staged
+# changes. If something is still staged, the AI tool didn't commit it.
+if git rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
+	&& ! git diff --cached --quiet
+then
+	echo "⚠️  Changes are still staged after the AI tool ran -- it may not" >&2
+	echo "   have committed. Check 'git status' before pushing." >&2
+fi
+
+# ---------------------------------------------------------------------------
+# (3) Push: ask (per push) whether this one needs a CI build, unless a push
+# mode was pinned on the command line.
+# ---------------------------------------------------------------------------
+if [ "${_PUSH_MODE}" = "none" ]; then
+	echo "⏭️  Skipping push (--no-push)." >&2
+	exit 0
+fi
+
+if [ "${_PUSH_MODE}" = "ask" ]; then
+	printf '🚀 Push to origin/%s?  [c] with CI  [s] skip CI  [n] don'\''t push: ' "${_BRANCH}" >&2
+	read -r _push_ans || _push_ans="n"
+	case "${_push_ans}" in
+		c|C) _PUSH_MODE="ci" ;;
+		s|S) _PUSH_MODE="skip" ;;
+		n|N|"") _PUSH_MODE="none" ;;
+		*)
+			echo "⚠️  Unrecognised choice '${_push_ans}'; not pushing." >&2
+			_PUSH_MODE="none"
+			;;
+	esac
+fi
+
+if [ "${_PUSH_MODE}" = "none" ]; then
+	echo "⏭️  Not pushing. Your commit is local." >&2
+	exit 0
+fi
+
+# Set upstream on the first push of a new branch; otherwise a plain push.
+if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+	set -- push origin "${_BRANCH}"
+else
+	echo "🔗 No upstream yet; setting it with -u." >&2
+	set -- push -u origin "${_BRANCH}"
+fi
+
+if [ "${_PUSH_MODE}" = "skip" ]; then
+	echo "🚀 Pushing (CI skipped: -o ci.skip)..." >&2
+	git "$@" -o ci.skip
+else
+	echo "🚀 Pushing (CI will run)..." >&2
+	git "$@"
+fi
+
+echo "✅ Done." >&2

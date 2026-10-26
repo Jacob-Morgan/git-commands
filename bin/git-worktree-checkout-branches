@@ -1,0 +1,218 @@
+#!/bin/sh
+
+## Check out a worktree for every branch except the default one.
+##
+## For each remote branch (and any local branch) other than the
+## repository's default branch, add a git worktree checked out to that
+## branch. Worktrees are created under '.worktree-branches/' in the
+## repository root, named after the branch (slashes become dashes).
+##
+## Stale branches are skipped: by default a branch whose tip commit is
+## older than 3 months is not checked out. Change the window with
+## -a/--max-age <duration> (or $GIT_WORKTREE_MAX_AGE), and disable the
+## filter entirely with "0", "none", or "off".
+##
+## Usage: git worktree-checkout-branches [-a|--max-age <duration>]
+##                                       [remote]
+##
+## <duration> is anything GNU `date -d` accepts relative to now, e.g.
+## "3 months", "6 weeks", "90 days", "1 year". Use "0"/"none"/"off" to
+## check out every branch regardless of age.
+##
+## Override the worktree location with $GIT_WORKTREE_ROOT.
+
+set -e
+
+_MAX_AGE="${GIT_WORKTREE_MAX_AGE:-3 months}"
+_REMOTE=""
+
+# Parse options. Positional arg (if any) is the remote name.
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		-a|--max-age)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_MAX_AGE="$2"
+			shift
+			;;
+		--max-age=*)
+			_MAX_AGE="${1#--max-age=}"
+			;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			exit 2
+			;;
+		*)
+			if [ -n "${_REMOTE}" ]
+			then
+				echo "❌ Unexpected argument: '$1'." >&2
+				exit 2
+			fi
+			_REMOTE="$1"
+			;;
+	esac
+	shift
+done
+
+_REMOTE="${_REMOTE:-origin}"
+
+# User is not in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1
+then
+	echo "❌ '$(basename "${PWD}")' - Not a Git repository." >&2
+	exit 1
+fi
+
+# Resolve the age filter to a cutoff timestamp (seconds since epoch).
+# Branches whose tip commit predates the cutoff are skipped. An empty
+# value or "0"/"none"/"off" disables the filter.
+#
+# Durations are parsed portably across GNU and BSD `date`:
+#   * GNU date understands "<n> <unit> ago" directly.
+#   * BSD date (macOS) needs a compact "-<n><U>" token, where U is one of
+#     y/m/w/d/H/M/S. We normalise the unit word to that single letter.
+_CUTOFF=0
+case "${_MAX_AGE}" in
+	""|0|none|off|None|Off|NONE|OFF)
+		_CUTOFF=0
+		;;
+	*)
+		# Split "<number> <unit>" (a space is optional: "3months" works too).
+		_AGE_NUM="$(echo "${_MAX_AGE}" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\).*$/\1/p')"
+		_AGE_UNIT="$(echo "${_MAX_AGE}" | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*\([A-Za-z]*\).*$/\1/p')"
+
+		if [ -z "${_AGE_NUM}" ]
+		then
+			echo "❌ Could not parse max age '${_MAX_AGE}'." >&2
+			echo "   Try e.g. '3 months', '6 weeks', '90 days', or '0' to disable." >&2
+			exit 2
+		fi
+
+		# Normalise the unit word to a single BSD-date letter. Default to
+		# days when no unit is given (e.g. a bare "90").
+		case "$(echo "${_AGE_UNIT}" | tr '[:upper:]' '[:lower:]')" in
+			y|yr|yrs|year|years)       _AGE_BSD_UNIT="y" ;;
+			mo|mon|month|months)       _AGE_BSD_UNIT="m" ;;
+			w|wk|wks|week|weeks)       _AGE_BSD_UNIT="w" ;;
+			""|d|day|days)             _AGE_BSD_UNIT="d" ;;
+			h|hr|hrs|hour|hours)       _AGE_BSD_UNIT="H" ;;
+			min|mins|minute|minutes)   _AGE_BSD_UNIT="M" ;;
+			s|sec|secs|second|seconds) _AGE_BSD_UNIT="S" ;;
+			*)
+				echo "❌ Unknown max-age unit in '${_MAX_AGE}'." >&2
+				echo "   Use years, months, weeks, days, hours, minutes, or seconds." >&2
+				exit 2
+				;;
+		esac
+
+		# Try GNU date first ("<n> <unit> ago"), then BSD date ("-<n><U>").
+		_GNU_UNIT="${_AGE_UNIT:-days}"
+		_CUTOFF="$(date -d "${_AGE_NUM} ${_GNU_UNIT} ago" +%s 2>/dev/null \
+			|| date -v"-${_AGE_NUM}${_AGE_BSD_UNIT}" +%s 2>/dev/null \
+			|| echo "")"
+
+		if [ -z "${_CUTOFF}" ]
+		then
+			echo "❌ Could not compute cutoff for max age '${_MAX_AGE}'." >&2
+			exit 2
+		fi
+		;;
+esac
+
+# Where to place the worktrees. Default: ".worktree-branches/" in the
+# repo root.
+_TOPLEVEL="$(git rev-parse --show-toplevel)"
+_WORKTREE_ROOT="${GIT_WORKTREE_ROOT:-${_TOPLEVEL}/.worktree-branches}"
+
+# Determine the default branch name (without the remote prefix).
+_DEFAULT_BRANCH="$(git symbolic-ref --quiet --short "refs/remotes/${_REMOTE}/HEAD" 2>/dev/null | sed "s#^${_REMOTE}/##")"
+
+if [ -z "${_DEFAULT_BRANCH}" ]
+then
+	# Fall back to the currently checked-out branch.
+	_DEFAULT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+fi
+
+echo "🌳 Default branch is '${_DEFAULT_BRANCH}' (excluded)."
+if [ "${_CUTOFF}" -gt 0 ]
+then
+	echo "🕰️  Skipping branches with no commit since '${_MAX_AGE}' ago."
+fi
+echo "🌳 Creating worktrees under '${_WORKTREE_ROOT}'..."
+
+mkdir -p "${_WORKTREE_ROOT}"
+
+# Keep the in-repo worktree dir out of git. Only manage ignores when the
+# worktree root actually lives inside the repository.
+case "${_WORKTREE_ROOT}" in
+	"${_TOPLEVEL}"/*)
+		_IGNORE_ENTRY="$(echo "${_WORKTREE_ROOT#"${_TOPLEVEL}"/}" | sed 's#/*$#/#')"
+		_EXCLUDE_FILE="$(git rev-parse --git-path info/exclude)"
+		if ! git check-ignore -q "${_WORKTREE_ROOT}" 2>/dev/null
+		then
+			echo "🙈 Adding '${_IGNORE_ENTRY}' to ${_EXCLUDE_FILE}."
+			mkdir -p "$(dirname "${_EXCLUDE_FILE}")"
+			echo "${_IGNORE_ENTRY}" >> "${_EXCLUDE_FILE}"
+		fi
+		;;
+esac
+
+# Collect candidate branch names from remote branches.
+for _REMOTE_BRANCH in $(git branch -r | sed 's/^[* ] //' | grep -v -- '->')
+do
+	_BRANCH_NAME="$(echo "${_REMOTE_BRANCH}" | cut -d/ -f2-)"
+
+	# Skip the symbolic HEAD and the default branch.
+	[ "${_BRANCH_NAME}" = "HEAD" ] && continue
+	[ "${_BRANCH_NAME}" = "${_DEFAULT_BRANCH}" ] && continue
+
+	# Skip stale branches whose tip commit predates the cutoff.
+	if [ "${_CUTOFF}" -gt 0 ]
+	then
+		_COMMIT_TS="$(git for-each-ref \
+			--format='%(committerdate:unix)' \
+			"refs/remotes/${_REMOTE_BRANCH}")"
+
+		if [ -n "${_COMMIT_TS}" ] && [ "${_COMMIT_TS}" -lt "${_CUTOFF}" ]
+		then
+			echo "⏭️  '${_BRANCH_NAME}' is stale (last commit before cutoff), skipping."
+			continue
+		fi
+	fi
+
+	# Skip branches that are already checked out in a worktree.
+	if git worktree list --porcelain | grep -q "branch refs/heads/${_BRANCH_NAME}$"
+	then
+		echo "⏭️  '${_BRANCH_NAME}' already has a worktree, skipping."
+		continue
+	fi
+
+	_WORKTREE_PATH="${_WORKTREE_ROOT}/$(echo "${_BRANCH_NAME}" | tr '/' '-')"
+
+	if [ -e "${_WORKTREE_PATH}" ]
+	then
+		echo "⏭️  Path '${_WORKTREE_PATH}' exists, skipping '${_BRANCH_NAME}'."
+		continue
+	fi
+
+	if git show-ref --quiet --verify "refs/heads/${_BRANCH_NAME}"
+	then
+		# Local branch already exists; check it out in the worktree.
+		echo "➕ Adding worktree for existing branch '${_BRANCH_NAME}'."
+		git worktree add "${_WORKTREE_PATH}" "${_BRANCH_NAME}"
+	else
+		# Create a new local tracking branch in the worktree.
+		echo "➕ Adding worktree for new branch '${_BRANCH_NAME}'."
+		git worktree add -b "${_BRANCH_NAME}" "${_WORKTREE_PATH}" "${_REMOTE_BRANCH}"
+	fi
+done
+
+echo "✅ Done."

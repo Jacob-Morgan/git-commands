@@ -1,0 +1,64 @@
+#!/bin/sh
+
+## Print the root (top level) directory of the current repository.
+##
+## Usage: git goto-root [--help|-h]
+##
+## Resolves the working tree's top-level directory and prints it on the
+## final line, so you can jump there from your shell:
+##
+##     cd "$(git goto-root)"
+##
+## A command cannot change its parent shell's directory, so this prints the
+## path rather than cd-ing itself (the same pattern git-get / git-edit use
+## for their result line). Wrap it in a shell function or alias for a
+## one-word "go to the repo root" gesture, e.g. in ~/.zshrc or ~/.bashrc:
+##
+##     groot() { cd "$(git goto-root)"; }
+##
+## Behaviour:
+##   - Inside a working tree -> print its top-level directory (the main
+##     checkout, or the worktree's own root when run from a linked
+##     worktree) and exit 0.
+##   - Inside a bare repository (no working tree) -> fail: there is no root
+##     working directory to go to.
+##   - Not in a Git repository -> fail.
+
+set -e
+
+# Surface this command's own help rather than letting an unknown flag fall
+# through to git's man-page lookup.
+case "$1" in
+	-h|--help)
+		sed -n 's/^## \{0,1\}//p' "$0"
+		exit 0
+		;;
+	-*)
+		echo "❌ Unknown option: '$1'." >&2
+		echo "   Usage: git goto-root [--help|-h]" >&2
+		exit 2
+		;;
+	?*)
+		echo "❌ Unexpected argument: '$1'." >&2
+		echo "   Usage: git goto-root [--help|-h]" >&2
+		exit 2
+		;;
+esac
+
+# `--show-toplevel` is empty (and the command exits non-zero) when we are
+# not inside a working tree -- either not in a repo at all, or inside a bare
+# repo. Distinguish the two for a clearer diagnostic.
+if ! _ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || [ -z "${_ROOT}" ]
+then
+	if [ "$(git rev-parse --is-bare-repository 2>/dev/null)" = "true" ]
+	then
+		echo "❌ This is a bare repository; it has no working-tree root." >&2
+	else
+		echo "❌ The current directory is not a Git repository." >&2
+	fi
+	exit 1
+fi
+
+# The final line is the result directory, matching the sister commands so
+# it can be consumed with `cd "$(git goto-root)"`.
+echo "${_ROOT}"

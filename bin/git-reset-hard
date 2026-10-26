@@ -1,0 +1,361 @@
+#!/bin/sh
+
+## Reset the working tree to match upstream and wipe it clean of build
+## artifacts, optionally keeping a stash of what was there.
+##
+## Usage: git reset-hard [--no-stash] [--no-stash-tracked]
+##                       [--no-stash-untracked] [-r|--ref <ref>]
+##                       [-n|--dry-run] [-y|--yes]
+##
+## The goal is to get back to a pristine checkout: the index and tracked
+## files reset to a known commit (HEAD by default), and every untracked /
+## ignored file removed -- the build output, node_modules, vendored deps,
+## editor cruft, and anything else `git clean -fdx` sweeps away.
+##
+## By default nothing is lost silently: before the destructive step the
+## command stashes your changes so you can get them back. The four phases,
+## in order, are:
+##
+##   Stash  -> save tracked and untracked changes (see the options below)
+##   Reset  -> `git reset --hard <ref>`   (index + tracked files)
+##   Clean  -> `git clean -fdx`           (untracked AND ignored files)
+##   Apply  -> `git stash apply` the stash made in phase 1 (kept, not
+##             popped, so it survives even if apply hits a conflict)
+##
+## This is the "nuke it from orbit, but keep a copy" button: handy when a
+## build has wedged the tree, when ignored artifacts are shadowing a clean
+## rebuild, or when you want to retry a change from a known-good base
+## without hunting down every stray file by hand.
+##
+## Options:
+##   --no-stash              Skip the Stash and Apply phases entirely; just
+##                           reset and clean (destructive -- nothing kept).
+##   --no-stash-tracked      Don't include tracked changes in the stash.
+##   --no-stash-untracked    Don't include untracked files in the stash
+##                           (they are still removed by the clean phase).
+##   -r, --ref <ref>         Reset to <ref> instead of HEAD. Point it at the
+##                           upstream tip to match upstream exactly, e.g.
+##                           `--ref @{upstream}` or `--ref origin/main`.
+##   -n, --dry-run           Show what each phase would do; change nothing.
+##   -y, --yes               Don't prompt for confirmation before the
+##                           destructive reset/clean.
+##   -h, --help              Show this help.
+##
+## Both stash dimensions are ON by default, so a plain `git reset-hard`
+## stashes everything (tracked + untracked), resets, cleans, then re-applies
+## the stash. Turn either off independently, or use --no-stash to keep
+## nothing. Ignored files (the bulk of build artifacts) are never stashed --
+## the point is to clear them -- but the clean phase always removes them.
+##
+## Exit status:
+##   0  success
+##   1  a runtime failure (not in a repo, a git command failed)
+##   2  a usage error (unknown option, missing value)
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
+_STASH_TRACKED=1
+_STASH_UNTRACKED=1
+_REF="HEAD"
+_DRY_RUN=0
+_ASSUME_YES=0
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		--no-stash)
+			_STASH_TRACKED=0
+			_STASH_UNTRACKED=0
+			;;
+		--no-stash-tracked)
+			_STASH_TRACKED=0
+			;;
+		--no-stash-untracked)
+			_STASH_UNTRACKED=0
+			;;
+		-r|--ref)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_REF="$2"
+			shift
+			;;
+		--ref=*)
+			_REF="${1#--ref=}"
+			;;
+		-n|--dry-run)
+			_DRY_RUN=1
+			;;
+		-y|--yes)
+			_ASSUME_YES=1
+			;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			echo "   Usage: git reset-hard [--no-stash] [--no-stash-tracked]" >&2
+			echo "                         [--no-stash-untracked] [-r|--ref <ref>]" >&2
+			echo "                         [-n|--dry-run] [-y|--yes]" >&2
+			exit 2
+			;;
+		*)
+			echo "❌ Unexpected argument: '$1'." >&2
+			exit 2
+			;;
+	esac
+	shift
+done
+
+if [ "$#" -gt 0 ]
+then
+	echo "❌ Unexpected argument: '$1'." >&2
+	exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# We must be inside a working tree (not a bare repo, not outside a repo).
+# ---------------------------------------------------------------------------
+if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" != "true" ]
+then
+	echo "❌ Not inside a Git working tree." >&2
+	exit 1
+fi
+
+# Validate the reset target up front so a typo fails before we touch
+# anything. rev-parse --verify resolves refs, @{upstream}, SHAs, etc.
+if ! _REF_SHA="$(git rev-parse --verify --quiet "${_REF}^{commit}" 2>/dev/null)"
+then
+	echo "❌ Cannot resolve reset target '${_REF}' to a commit." >&2
+	echo "   Pass an existing ref/commit, e.g. HEAD, origin/main, @{upstream}." >&2
+	exit 1
+fi
+
+# A short, human-friendly form of what we're resetting to, for messages.
+_REF_DESC="${_REF}"
+if [ "${_REF}" != "${_REF_SHA}" ]
+then
+	_REF_DESC="${_REF} ($(git rev-parse --short "${_REF_SHA}"))"
+fi
+
+# ---------------------------------------------------------------------------
+# Decide whether we will stash, and with which `git stash push` flag.
+#
+#   tracked + untracked  -> --include-untracked  (-u)
+#   tracked only         -> (no flag; the default stash)
+#   untracked only       -> stash *only* untracked; git has no single flag
+#                           for this, so we emulate it below.
+#   neither              -> no stash at all.
+#
+# Ignored files are deliberately never stashed: clearing them is the whole
+# point, so --all (-a) is intentionally not used.
+# ---------------------------------------------------------------------------
+_DO_STASH=0
+if [ "${_STASH_TRACKED}" -eq 1 ] || [ "${_STASH_UNTRACKED}" -eq 1 ]
+then
+	_DO_STASH=1
+fi
+
+# Is there anything to stash? `git status --porcelain` lists tracked
+# modifications and untracked files (one line each); ignored files are not
+# shown without --ignored, so they never count here.
+_HAS_TRACKED_CHANGES=0
+if ! git diff --quiet || ! git diff --cached --quiet
+then
+	_HAS_TRACKED_CHANGES=1
+fi
+
+_HAS_UNTRACKED=0
+if [ -n "$(git ls-files --others --exclude-standard)" ]
+then
+	_HAS_UNTRACKED=1
+fi
+
+# A tag we stamp on our stash so the Apply phase can find exactly the one we
+# created, even if other stashes exist.
+_STASH_MSG="git-reset-hard $(date +%Y-%m-%dT%H:%M:%S)"
+
+# ---------------------------------------------------------------------------
+# Confirmation. reset --hard + clean -fdx is destructive and (for anything
+# not stashed, and always for ignored files) unrecoverable, so prompt unless
+# --yes or --dry-run.
+# ---------------------------------------------------------------------------
+if [ "${_DRY_RUN}" -eq 0 ] && [ "${_ASSUME_YES}" -eq 0 ]
+then
+	echo "⚠️  About to hard-reset to ${_REF_DESC} and remove ALL untracked and" >&2
+	echo "   ignored files (git clean -fdx) in $(git rev-parse --show-toplevel)." >&2
+	if [ "${_DO_STASH}" -eq 1 ]
+	then
+		echo "   A stash of your changes will be kept so you can recover them;" >&2
+		echo "   ignored files (build artifacts) are NOT stashed and will be lost." >&2
+	else
+		echo "   --no-stash: nothing will be kept. This cannot be undone." >&2
+	fi
+	printf '   Continue? [y/N] ' >&2
+	read -r _ans
+	case "${_ans}" in
+		y|Y|yes|Yes|YES) ;;
+		*)
+			echo "🚫 Aborted; nothing changed." >&2
+			exit 1
+			;;
+	esac
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Stash.
+# ---------------------------------------------------------------------------
+_STASH_CREATED=0
+
+do_stash() {
+	# Nothing selected to stash.
+	[ "${_DO_STASH}" -eq 1 ] || { echo "⏭️  Stash: skipped (--no-stash)." >&2; return 0; }
+
+	# Figure out whether there is anything in scope to stash.
+	_want_tracked=0
+	_want_untracked=0
+	[ "${_STASH_TRACKED}" -eq 1 ] && [ "${_HAS_TRACKED_CHANGES}" -eq 1 ] && _want_tracked=1
+	[ "${_STASH_UNTRACKED}" -eq 1 ] && [ "${_HAS_UNTRACKED}" -eq 1 ] && _want_untracked=1
+
+	if [ "${_want_tracked}" -eq 0 ] && [ "${_want_untracked}" -eq 0 ]
+	then
+		echo "⏭️  Stash: nothing to stash in scope." >&2
+		return 0
+	fi
+
+	if [ "${_want_tracked}" -eq 1 ] && [ "${_want_untracked}" -eq 1 ]
+	then
+		_scope="tracked + untracked"
+		_desc="git stash push --include-untracked --message '${_STASH_MSG}'"
+	elif [ "${_want_tracked}" -eq 1 ]
+	then
+		_scope="tracked only"
+		_desc="git stash push --message '${_STASH_MSG}'"
+	else
+		_scope="untracked only"
+		# git has no "stash untracked only" flag. We emulate it by naming the
+		# untracked files as pathspecs to `git stash push -u`, so only those
+		# files (not the tracked changes) go into the stash (untracked_only_stash).
+		_desc="git stash push --include-untracked -- <each untracked path>"
+	fi
+
+	if [ "${_DRY_RUN}" -eq 1 ]
+	then
+		echo "📦 Stash (${_scope}): would run ${_desc}" >&2
+		return 0
+	fi
+
+	echo "📦 Stash (${_scope})..." >&2
+	if [ "${_scope}" = "untracked only" ]
+	then
+		untracked_only_stash
+	elif [ "${_want_tracked}" -eq 1 ] && [ "${_want_untracked}" -eq 1 ]
+	then
+		git stash push --include-untracked --message "${_STASH_MSG}"
+	else
+		git stash push --message "${_STASH_MSG}"
+	fi
+	_STASH_CREATED=1
+}
+
+# Stash ONLY untracked files, leaving tracked changes in place. git has no
+# flag for this, so we name every untracked path as a pathspec to a single
+# `git stash push --include-untracked -- <paths>` -- with explicit paths it
+# stashes just those files. The list is NUL-delimited through xargs -0 so
+# names with spaces or newlines survive, and `--` stops a leading-dash name
+# being read as an option. One git invocation means one stash entry.
+untracked_only_stash() {
+	_tmp="$(mktemp "${TMPDIR:-/tmp}/git-reset-hard.XXXXXX")"
+	git ls-files --others --exclude-standard -z > "${_tmp}"
+	if [ ! -s "${_tmp}" ]
+	then
+		rm -f "${_tmp}"
+		echo "⏭️  Stash: no untracked files to stash." >&2
+		return 0
+	fi
+	xargs -0 git stash push --include-untracked \
+		--message "${_STASH_MSG}" -- < "${_tmp}"
+	rm -f "${_tmp}"
+}
+
+do_stash
+
+# ---------------------------------------------------------------------------
+# Phase 2 — Reset.
+# ---------------------------------------------------------------------------
+if [ "${_DRY_RUN}" -eq 1 ]
+then
+	echo "♻️  Reset: would run git reset --hard ${_REF_DESC}" >&2
+else
+	echo "♻️  Reset --hard ${_REF_DESC}..." >&2
+	git reset --hard "${_REF_SHA}"
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Clean. -f force, -d directories, -x ignored files too.
+# ---------------------------------------------------------------------------
+if [ "${_DRY_RUN}" -eq 1 ]
+then
+	echo "🧹 Clean: would run git clean -fdx. Files that would be removed:" >&2
+	# -n lists without deleting; indent for readability.
+	git clean -ndx | sed 's/^/     /' >&2
+else
+	echo "🧹 Clean -fdx (removing untracked and ignored files)..." >&2
+	git clean -fdx
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Apply the stash we created (if any). We `apply` rather than
+# `pop` so a conflicting apply does not drop the stash: the saved state
+# survives for a manual recovery. On a clean apply we then drop it.
+# ---------------------------------------------------------------------------
+if [ "${_DRY_RUN}" -eq 1 ]
+then
+	if [ "${_DO_STASH}" -eq 1 ]
+	then
+		echo "📥 Apply: would git stash apply the stash created in phase 1." >&2
+	fi
+elif [ "${_STASH_CREATED}" -eq 1 ]
+then
+	# Find our stash by its unique message (newest match wins).
+	_stash_ref="$(git stash list --format='%gd %gs' \
+		| grep -F "${_STASH_MSG}" \
+		| head -n 1 \
+		| cut -d' ' -f1)"
+
+	if [ -z "${_stash_ref}" ]
+	then
+		echo "⚠️  Apply: could not locate the stash we created; leaving stashes" >&2
+		echo "   untouched. Check 'git stash list' to recover your changes." >&2
+	else
+		echo "📥 Apply ${_stash_ref}..." >&2
+		if git stash apply "${_stash_ref}"
+		then
+			# Clean apply: drop our stash so it doesn't linger.
+			git stash drop "${_stash_ref}" >/dev/null 2>&1 || true
+			echo "✅ Reapplied your changes and dropped the temporary stash." >&2
+		else
+			echo "⚠️  Apply hit a conflict. Your changes are preserved in" >&2
+			echo "   ${_stash_ref} ('${_STASH_MSG}'); resolve, then drop it." >&2
+			echo "   The reset/clean still succeeded." >&2
+			exit 1
+		fi
+	fi
+fi
+
+if [ "${_DRY_RUN}" -eq 1 ]
+then
+	echo "✅ Dry run complete; nothing changed." >&2
+else
+	echo "✅ Working tree reset to ${_REF_DESC} and cleaned." >&2
+fi

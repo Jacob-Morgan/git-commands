@@ -1,0 +1,93 @@
+#!/bin/sh
+
+## Print the git identity that would be used for a commit here.
+##
+## Shows the author (and committer, when it differs) as "Name <email>".
+## Each field is resolved through a fallback chain:
+##   name:  git config user.name  ->  OS account full name (GECOS)
+##   email: git config user.email ->  $EMAIL  ->  user@host.fqdn
+##
+## Useful for confirming which identity a repo will attribute commits to,
+## e.g. when juggling work/personal configs across repositories.
+##
+## The final fallbacks resolve the hostname and OS account name in a way
+## that works on both macOS/BSD and GNU/Linux (see get_fqdn / get_gecos).
+
+set -e
+
+# Fully-qualified hostname, portable across macOS/BSD and Linux.
+#   - `hostname -f` works on Linux and modern macOS.
+#   - Fall back to a plain `hostname` if -f is unsupported/fails.
+get_fqdn() {
+	hostname -f 2>/dev/null || hostname 2>/dev/null || echo localhost
+}
+
+# Full name (GECOS) for the current user, portable across platforms.
+#   - getent: GNU/Linux.
+#   - dscl:   macOS Directory Services.
+# Prints nothing (non-zero) if neither yields a name, so callers can
+# fall through to the next option.
+get_gecos() {
+	_user="$(id -un)"
+	if command -v getent >/dev/null 2>&1; then
+		getent passwd "$_user" | cut -d : -f 5 | cut -d , -f 1
+	elif command -v dscl >/dev/null 2>&1; then
+		# `dscl` prints "RealName:" then the value, which may be inline
+		# ("RealName: Jane Doe") or on the following line (indented).
+		# Strip the key, drop blank lines, take the first remaining line,
+		# then trim any leading/trailing whitespace from it.
+		dscl . -read "/Users/$_user" RealName 2>/dev/null \
+			| sed 's/^RealName:[[:space:]]*//' \
+			| sed '/^$/d' \
+			| head -n 1 \
+			| sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+	else
+		return 1
+	fi
+}
+
+# Resolve the commit email.
+#   1. git config user.email (exits non-zero when unset -> falls through)
+#   2. the $EMAIL environment variable, if set and non-empty
+#   3. a constructed "login@fully-qualified-hostname" as a last resort
+get_email() {
+	git config user.email && return 0
+	if [ -n "$EMAIL" ]; then
+		echo "$EMAIL" && return 0
+	fi
+	echo "$(id -un)@$(get_fqdn)"
+}
+
+# Resolve the commit author name.
+#   1. git config user.name (exits non-zero when unset -> falls through)
+#   2. the full-name (GECOS) field from the OS account database
+#   3. the bare login name, so the result is never empty
+get_name() {
+	git config user.name && return 0
+	_gecos="$(get_gecos)"
+	if [ -n "$_gecos" ]; then
+		echo "$_gecos" && return 0
+	fi
+	id -un
+}
+
+# Populate each identity variable only if it isn't already set in the
+# environment. `: ${VAR=value}` is the POSIX assign-if-unset idiom: it
+# lets a caller override any field by exporting GIT_AUTHOR_NAME etc.,
+# and otherwise falls back to the resolved value.
+: ${GIT_AUTHOR_NAME="$(get_name)"}
+: ${GIT_COMMITTER_NAME="$(get_name)"}
+: ${GIT_AUTHOR_EMAIL="$(get_email)"}
+: ${GIT_COMMITTER_EMAIL="$(get_email)"}
+
+author="$GIT_AUTHOR_NAME <$GIT_AUTHOR_EMAIL>"
+commit="$GIT_COMMITTER_NAME <$GIT_COMMITTER_EMAIL>"
+
+# Collapse to a single line when author and committer match (the common
+# case); otherwise label both so the difference is obvious.
+if [ "$author" = "$commit" ]; then
+	echo "$author"
+else
+	echo "Author: $author"
+	echo "Commit: $commit"
+fi

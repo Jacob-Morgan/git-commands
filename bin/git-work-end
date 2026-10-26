@@ -1,0 +1,307 @@
+#!/bin/sh
+
+## Commit, push, then create/update the branch's merge request.
+##
+## Usage: git work end [--ci-skip|--ci] [--commit-prompt <text>]
+##                     [--mr-prompt <text>]
+##
+## Reached as `git work end`, or directly as `git work-end`.
+##
+## The close-out of a unit of work. It:
+##   (1) runs `git work commit` so the latest changes are staged, committed
+##       (via your AI CLI tool), and pushed. If that step fails for any
+##       reason -- nothing staged, a bad push, you decline the commit --
+##       `end` gives up then and there (it never creates an MR on top of an
+##       uncommitted or unpushed state).
+##   (2) makes sure the branch is on the remote: a merge request needs a
+##       pushed branch, so if `commit` left it unpushed (you chose "don't
+##       push"), `end` asks once more and pushes, or gives up if you still
+##       decline.
+##   (3) hands the MR prompt to your AI CLI tool, which creates the merge
+##       request for the current branch -- or, if one already exists,
+##       refreshes its description to match everything on the branch.
+##
+## Options:
+##   --ci-skip               Forwarded to `git work commit`: push with
+##                           `-o ci.skip` (skip CI) without asking.
+##   --ci                    Forwarded to `git work commit`: push normally
+##                           (run CI) without asking.
+##   --commit-prompt <text>  Override the commit prompt (see git work commit).
+##   --mr-prompt <text>      Override the MR prompt handed to the AI tool.
+##   -h, --help              Show this help.
+##
+## MR prompt, highest precedence first:
+##     --mr-prompt <text>          (this invocation)
+##     git config work.aiMrPrompt  (persistent default)
+##     create a merge request for the current branch, ...  (built-in)
+## A configured-but-empty work.aiMrPrompt is an error, not a fallback.
+##
+## The commit prompt is resolved by `git work commit` (--commit-prompt here,
+## else git config work.aiCommitPrompt, else its built-in default).
+##
+## Without --ci-skip / --ci, the commit step's push is interactive (per-push
+## "with CI / skip CI / don't push" choice); `end` then ensures a push
+## happened before the MR step.
+##
+## AI CLI tool: resolved exactly as in `git work commit` ($AI_CLI_TOOL, then
+## `git config work.aiTool`; no fallback). The same tool drives both the
+## commit and the MR, and the same contract applies to BOTH hand-offs: the
+## configured command must be single-shot (runs one request, then exits --
+## an interactive REPL hangs this command) and run in agent mode (actually
+## creates/updates the MR via glab/gh, not just a chat reply). The prompt is
+## passed as the single final positional argument. None of this is enforced
+## here; it's the developer's job to configure the tool accordingly. See the
+## full "AI CLI tool contract" in `git work commit --help`.
+##
+## Exit status:
+##   0  committed, pushed, and the MR created/updated
+##   1  a runtime failure (the commit step failed, the branch wasn't pushed,
+##      the AI tool is missing, or the MR step failed)
+##   2  a usage error (unknown option, missing value)
+
+set -e
+
+_DEFAULT_MR_PROMPT='create a merge request for the current branch, if one already exists ensure the description is accurate for all changes in the branch'
+
+_usage() {
+	echo "Usage: git work end [--ci-skip|--ci] [--commit-prompt <text>] [--mr-prompt <text>]" >&2
+}
+
+# Resolve the MR prompt when --mr-prompt wasn't given: git config
+# work.aiMrPrompt, then the built-in default. A configured-but-empty value
+# is an error rather than falling through to the default.
+_resolve_mr_prompt() {
+	if _cfg="$(git config work.aiMrPrompt 2>/dev/null)"; then
+		if [ -z "${_cfg}" ]; then
+			echo "❌ git config 'work.aiMrPrompt' is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${_cfg}"
+		return 0
+	fi
+	printf '%s' "${_DEFAULT_MR_PROMPT}"
+}
+
+_show_help() {
+	sed -n 's/^## \{0,1\}//p' "$0"
+}
+
+# ---------------------------------------------------------------------------
+# Resolve the sibling `git-work-commit` next to this script, falling back to
+# a PATH-resolved form.
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+_resolve_sibling() {
+	_sib="${_SCRIPT_DIR}/$1"
+	if [ -x "${_sib}" ]; then
+		printf '%s\n' "${_sib}"
+	elif command -v "$1" >/dev/null 2>&1; then
+		printf '%s\n' "$1"
+	else
+		echo "❌ Could not find the sibling '$1' command." >&2
+		return 1
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Resolve the AI CLI tool: $AI_CLI_TOOL, then `git config work.aiTool`. Kept
+# in sync with git-work-commit's resolution so the two agree.
+# ---------------------------------------------------------------------------
+_resolve_ai_tool() {
+	if [ -n "${AI_CLI_TOOL+set}" ]; then
+		if [ -z "${AI_CLI_TOOL}" ]; then
+			echo "❌ \$AI_CLI_TOOL is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${AI_CLI_TOOL}"
+		return 0
+	fi
+	if _cfg="$(git config work.aiTool 2>/dev/null)"; then
+		if [ -z "${_cfg}" ]; then
+			echo "❌ git config 'work.aiTool' is set but empty." >&2
+			exit 1
+		fi
+		printf '%s' "${_cfg}"
+		return 0
+	fi
+	echo "❌ No AI CLI tool configured for 'git work end'." >&2
+	echo "   Set \$AI_CLI_TOOL (e.g. 'kiro-cli --v3') or run:" >&2
+	echo "     git config work.aiTool 'kiro-cli --v3'" >&2
+	exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
+_CI_FLAG=""
+_COMMIT_PROMPT_SET=0
+_COMMIT_PROMPT=""
+_MR_PROMPT=""
+_MR_PROMPT_SET=0
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		--ci-skip)
+			_CI_FLAG="--ci-skip"
+			;;
+		--ci)
+			_CI_FLAG="--ci"
+			;;
+		--commit-prompt)
+			if [ "$#" -lt 2 ]; then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_COMMIT_PROMPT="$2"
+			_COMMIT_PROMPT_SET=1
+			shift
+			;;
+		--commit-prompt=*)
+			_COMMIT_PROMPT="${1#--commit-prompt=}"
+			_COMMIT_PROMPT_SET=1
+			;;
+		--mr-prompt)
+			if [ "$#" -lt 2 ]; then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_MR_PROMPT="$2"
+			_MR_PROMPT_SET=1
+			shift
+			;;
+		--mr-prompt=*)
+			_MR_PROMPT="${1#--mr-prompt=}"
+			_MR_PROMPT_SET=1
+			;;
+		-h|--help)
+			_show_help
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			_usage
+			exit 2
+			;;
+		*)
+			echo "❌ Unexpected argument: '$1'." >&2
+			_usage
+			exit 2
+			;;
+	esac
+	shift
+done
+
+if [ "$#" -gt 0 ]; then
+	echo "❌ Unexpected argument: '$1'." >&2
+	_usage
+	exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Must be inside a repository with a checked-out branch.
+# ---------------------------------------------------------------------------
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+	echo "❌ Not inside a Git repository." >&2
+	exit 1
+fi
+
+# Use symbolic-ref (not `rev-parse --abbrev-ref HEAD`) so an unborn branch
+# (no commits yet) is accepted and only a genuine detached HEAD is rejected.
+if ! _BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)" || [ -z "${_BRANCH}" ]; then
+	echo "❌ No branch is checked out (detached HEAD?)." >&2
+	exit 1
+fi
+
+# Resolve the AI tool up front so a missing one fails before we commit.
+_AI_TOOL="$(_resolve_ai_tool)"
+_GIT_WORK_COMMIT="$(_resolve_sibling git-work-commit)" || exit 1
+
+# Resolve the MR prompt: an explicit --mr-prompt wins; otherwise fall back
+# to git config work.aiMrPrompt, then the built-in default. The commit
+# prompt is NOT resolved here -- when --commit-prompt isn't given, the
+# forwarded git-work-commit resolves work.aiCommitPrompt itself, keeping a
+# single source of truth for that key.
+if [ "${_MR_PROMPT_SET}" -eq 0 ]; then
+	_MR_PROMPT="$(_resolve_mr_prompt)"
+fi
+
+# ---------------------------------------------------------------------------
+# (1) Commit (and push, per that command's rules). Give up on any failure.
+# ---------------------------------------------------------------------------
+echo "═══ Step 1/2: commit ═══" >&2
+
+# Build the argument list for the git-work-commit executable (no "commit"
+# word -- _GIT_WORK_COMMIT already IS that command).
+set --
+[ -n "${_CI_FLAG}" ] && set -- "$@" "${_CI_FLAG}"
+[ "${_COMMIT_PROMPT_SET}" -eq 1 ] && set -- "$@" --prompt "${_COMMIT_PROMPT}"
+
+if ! "${_GIT_WORK_COMMIT}" "$@"; then
+	echo "❌ 'git work commit' failed; not creating a merge request." >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# (2) Ensure the branch is on the remote, then create/update the MR.
+# ---------------------------------------------------------------------------
+echo "═══ Step 2/2: merge request ═══" >&2
+
+# A merge request needs a pushed branch. The commit step may have left it
+# unpushed (the user chose "don't push", or there are local commits ahead
+# of the upstream). Detect that and offer to push before the MR step.
+_needs_push=0
+if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+	# No upstream at all -- definitely not on the remote.
+	_needs_push=1
+elif [ -n "$(git rev-list '@{upstream}..HEAD' 2>/dev/null)" ]; then
+	# Local commits not yet on the upstream.
+	_needs_push=1
+fi
+
+if [ "${_needs_push}" -eq 1 ]; then
+	echo "⚠️  The branch isn't fully pushed; a merge request needs it on the remote." >&2
+	printf '🚀 Push origin/%s now?  [c] with CI  [s] skip CI  [n] give up: ' "${_BRANCH}" >&2
+	read -r _ans || _ans="n"
+
+	if git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+		set -- push origin "${_BRANCH}"
+	else
+		set -- push -u origin "${_BRANCH}"
+	fi
+
+	case "${_ans}" in
+		c|C)
+			echo "🚀 Pushing (CI will run)..." >&2
+			git "$@"
+			;;
+		s|S)
+			echo "🚀 Pushing (CI skipped: -o ci.skip)..." >&2
+			git "$@" -o ci.skip
+			;;
+		*)
+			echo "🛑 Branch not pushed; giving up without creating a merge request." >&2
+			exit 1
+			;;
+	esac
+fi
+
+echo "🤖 Handing the merge request to: ${_AI_TOOL}" >&2
+# Synchronous foreground hand-off: we block until the tool exits, then
+# branch on its status. The configured command must be single-shot and in
+# agent mode so it actually creates/updates the MR and terminates (see the
+# contract in `git work commit --help`). The value may carry its own args
+# (e.g. "kiro-cli --v3"), so leave it unquoted for word-splitting; the
+# prompt is a single final argument.
+# shellcheck disable=SC2086
+if ! ${_AI_TOOL} "${_MR_PROMPT}"; then
+	echo "❌ The AI CLI tool exited non-zero; merge request not confirmed." >&2
+	exit 1
+fi
+
+echo "✅ Done." >&2

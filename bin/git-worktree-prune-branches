@@ -1,0 +1,41 @@
+#!/bin/sh
+
+## Non-interactively remove worktrees whose upstream branch is gone.
+##
+## A thin wrapper around `git worktree-cleanup-branches` that assumes "yes"
+## to every prompt, so stale worktrees and their orphaned local branches
+## are pruned without confirmation. Intended for scripts, hooks, and CI
+## where there is no terminal to answer prompts.
+##
+## It passes only --yes, not --force, so a worktree with uncommitted
+## changes is still kept. Forward --force (or set $GIT_WORKTREE_FORCE=1) to
+## remove those too.
+##
+## Any arguments are forwarded to the underlying command, so you can still
+## pass a remote name or --dry-run / --no-fetch / --force.
+##
+## Usage: git worktree-prune-branches [-f|--force] [-n|--dry-run]
+##                                    [--no-fetch] [remote]
+##
+## Override the worktree location with $GIT_WORKTREE_ROOT.
+
+set -e
+
+# Resolve the sibling cleanup command next to this script so it works
+# regardless of the install location / current directory.
+_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+_CLEANUP="${_SCRIPT_DIR}/git-worktree-cleanup-branches"
+
+if [ ! -x "${_CLEANUP}" ]
+then
+	# Fall back to the git-resolved command (installed on PATH) if the
+	# sibling file isn't directly executable from here.
+	if git worktree-cleanup-branches --help >/dev/null 2>&1
+	then
+		exec git worktree-cleanup-branches --yes "$@"
+	fi
+	echo "❌ Could not find 'git-worktree-cleanup-branches'." >&2
+	exit 1
+fi
+
+exec "${_CLEANUP}" --yes "$@"

@@ -1,0 +1,14 @@
+#!/bin/sh
+
+## Synonym for `git pr` (GitLab's name for the same thing).
+##
+## Usage: git mr [url|open|view] [remote]
+##
+## GitHub calls it a pull request, GitLab a merge request; this command
+## covers both regardless of the name you reach for. It forwards every
+## argument to `git pr`, which detects the forge from the remote and drives
+## the matching CLI. See `git pr --help` for the full documentation.
+
+# Resolve `git-pr` next to this script so the synonym works no matter where
+# bin/ lives, then hand off entirely (exec, so exit status is preserved).
+exec "$(dirname "$0")/git-pr" "$@"

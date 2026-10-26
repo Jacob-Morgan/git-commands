@@ -1,0 +1,204 @@
+#!/bin/sh
+
+## Show the pull/merge request for the current branch (GitHub or GitLab).
+##
+## Usage: git pr [subcommand] [remote]
+##
+## Looks at the given remote (default: origin), decides whether it points
+## at GitHub or GitLab, and then drives the matching CLI -- `gh` for GitHub
+## pull requests, `glab` for GitLab merge requests -- to act on the request
+## associated with the CURRENT branch. Both CLIs resolve the current branch
+## on their own, so no branch argument is needed.
+##
+## The forge name is cosmetic: GitHub calls it a "pull request" and GitLab a
+## "merge request", but this one command covers both. `git mr` is a synonym.
+##
+## Subcommands:
+##   url [remote]    Print the URL of the request for the current branch,
+##                   or fail if there is none. (default)
+##   open [remote]   Open that request in a browser.
+##   view [remote]   Show the request (title, body, status) in the terminal.
+##   help            Show this help (also --help / -h).
+##
+## Forge detection:
+##   The remote URL is normalized the same way `git browse` does, then the
+##   host is inspected: a host containing "gitlab" uses `glab`, one
+##   containing "github" uses `gh`. Anything else is an error (point it at a
+##   recognizable host, or use the forge CLI directly).
+##
+## Requirements:
+##   The CLI for the detected forge must be installed and authenticated:
+##   `gh` (https://cli.github.com) for GitHub, `glab`
+##   (https://gitlab.com/gitlab-org/cli) for GitLab. A missing CLI is an
+##   error.
+##
+## Exit status:
+##   0  a request was found (and printed / opened / shown)
+##   1  no request for the current branch, or a setup error (missing
+##      remote, unrecognized host, missing CLI)
+##   2  usage error (unknown subcommand or extra argument)
+
+set -e
+
+_usage() {
+	echo "Usage: git pr [url|open|view] [remote]" >&2
+}
+
+_show_help() {
+	sed -n 's/^## \{0,1\}//p' "$0"
+}
+
+# Normalize a remote URL into its host, reusing the shapes `git browse`
+# handles: ssh://, git+ssh://, http(s)://, SCP-style git@host:path, with
+# optional userinfo and port. We only need the host here, so stop after the
+# scheme/userinfo/port are stripped and take everything up to the first
+# "/" or ":".
+_host_of_remote() {
+	_remote="$1"
+	if ! _raw="$(git config "remote.${_remote}.url")" || [ -z "${_raw}" ]; then
+		echo "❌ No URL configured for remote '${_remote}'." >&2
+		echo "   Available remotes: $(git remote | paste -sd, - 2>/dev/null)" >&2
+		exit 1
+	fi
+
+	# 1. drop the scheme  2. drop userinfo (up to a leading "user@")
+	# 3. cut at the first "/" or ":" -- whatever remains is host[:port]
+	# 4. drop a trailing ":port"
+	printf '%s' "${_raw}" | sed -E \
+		-e 's#^ssh://##' \
+		-e 's#^git\+ssh://##' \
+		-e 's#^https?://##' \
+		-e 's#^[^@/]*@##' \
+		-e 's#[/:].*$##'
+}
+
+# Echo a forge token ("github" or "gitlab") for a host, or fail.
+_forge_of_host() {
+	_host="$1"
+	case "${_host}" in
+		*gitlab*) printf 'gitlab' ;;
+		*github*) printf 'github' ;;
+		*)
+			echo "❌ Can't tell if '${_host}' is GitHub or GitLab." >&2
+			echo "   This command recognizes hosts whose name contains" >&2
+			echo "   'github' or 'gitlab'. For anything else, use the forge" >&2
+			echo "   CLI (gh / glab) directly." >&2
+			exit 1
+			;;
+	esac
+}
+
+# Ensure a required CLI is present, with a forge-appropriate message.
+_require_cli() {
+	_cli="$1"
+	if ! command -v "${_cli}" >/dev/null 2>&1; then
+		case "${_cli}" in
+			gh)
+				echo "❌ Could not find 'gh' (GitHub CLI) on your PATH." >&2
+				echo "   Install it from https://cli.github.com and run 'gh auth login'." >&2
+				;;
+			glab)
+				echo "❌ Could not find 'glab' (GitLab CLI) on your PATH." >&2
+				echo "   Install it from https://gitlab.com/gitlab-org/cli and run 'glab auth login'." >&2
+				;;
+		esac
+		exit 1
+	fi
+}
+
+# Print the request URL for the current branch, or fail if there is none.
+# Each CLI resolves the current branch itself; we ask for JSON and pull out
+# the URL field so the output is exactly the URL and nothing else.
+_print_url() {
+	_forge="$1"
+	case "${_forge}" in
+		github)
+			if ! _url="$(gh pr view --json url --jq .url 2>/dev/null)" || [ -z "${_url}" ]
+			then
+				echo "❌ No pull request found for the current branch." >&2
+				exit 1
+			fi
+			;;
+		gitlab)
+			if ! _url="$(glab mr view -F json 2>/dev/null \
+				| sed -n 's/.*"web_url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+				| head -n 1)" || [ -z "${_url}" ]
+			then
+				echo "❌ No merge request found for the current branch." >&2
+				exit 1
+			fi
+			;;
+	esac
+	printf '%s\n' "${_url}"
+}
+
+# Open the request for the current branch in a browser.
+_open_request() {
+	_forge="$1"
+	case "${_forge}" in
+		github) gh pr view --web ;;
+		gitlab) glab mr view --web ;;
+	esac
+}
+
+# Show the request for the current branch in the terminal.
+_view_request() {
+	_forge="$1"
+	case "${_forge}" in
+		github) gh pr view ;;
+		gitlab) glab mr view ;;
+	esac
+}
+
+# Reject any positional argument beyond the optional remote name.
+_at_most_one_remote() {
+	if [ "$#" -gt 1 ]; then
+		shift
+		echo "❌ Unexpected argument: '$1'." >&2
+		_usage
+		exit 2
+	fi
+}
+
+# --- Dispatch ---
+
+# The first argument is a subcommand only when it names one; otherwise the
+# default subcommand ("url") is assumed and the argument is the remote. This
+# keeps the common case terse: `git pr` and `git pr upstream` both work.
+_SUB='url'
+case "${1-}" in
+	-h|--help|help)
+		_show_help
+		exit 0
+		;;
+	url|open|view)
+		_SUB="$1"
+		shift
+		;;
+	-*)
+		echo "❌ Unknown option: '$1'." >&2
+		_usage
+		exit 2
+		;;
+	*)
+		# No subcommand given: leave _SUB at its default and treat any
+		# remaining argument(s) as the remote.
+		;;
+esac
+
+_at_most_one_remote "$@"
+_REMOTE="${1-origin}"
+
+_HOST="$(_host_of_remote "${_REMOTE}")"
+_FORGE="$(_forge_of_host "${_HOST}")"
+
+case "${_FORGE}" in
+	github) _require_cli gh ;;
+	gitlab) _require_cli glab ;;
+esac
+
+case "${_SUB}" in
+	url)  _print_url   "${_FORGE}" ;;
+	open) _open_request "${_FORGE}" ;;
+	view) _view_request "${_FORGE}" ;;
+esac

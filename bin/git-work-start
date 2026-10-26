@@ -1,0 +1,651 @@
+#!/bin/sh
+
+## Pick a worktree, branch, or new branch, then open it in your editor.
+##
+## The daily-driver entry point: it answers the question "what am I working
+## on?" and lands you in an editor on the right working tree, creating a
+## worktree for the chosen branch when one does not already exist.
+##
+## Usage: git work start [-a|--max-age <duration>] [-F|--fetch-only]
+##                       [-d|--dir <projects-dir>]
+##
+## Reached as `git work start` (the default subcommand of `git work`), or
+## directly as `git work-start`.
+##
+## Behaviour:
+##   Inside a Git repository, it presents an fzf menu that combines:
+##     * every existing worktree (except the one you're standing in),
+##       including the main checkout holding the default branch (shown as
+##       🏠 main), so the default branch is selectable too,
+##     * every other branch (local or remote-tracking) whose tip commit is
+##       within the max-age window (default 1 week), and
+##     * a "＋ new branch…" entry.
+##   Outside a Git repository, it first browses the repositories under the
+##   projects directory (same resolution as `git get`) with fzf, then runs
+##   the in-repo flow on the one you pick.
+##
+## For each choice:
+##   (1) existing worktree -> ask whether to update it first (fetch, stash,
+##       pull/rebase onto the default branch, re-apply the stash -- i.e.
+##       `git get` in place), then open it.
+##   (2) existing branch   -> check it out as a worktree under the repo's
+##       worktree root (via `git get --worktree`), then open it.
+##   (3) new branch        -> prompt for a name and create a worktree for a
+##       fresh branch off the default branch, then open it.
+##
+## In every case the worktree is opened with `git edit` (honoring your
+## $VISUAL / get.visual / $EDITOR / core.editor chain; see `git edit`).
+##
+## Options:
+##   -a, --max-age <duration>  Window for "recently changed" branches in
+##                             the menu (default 1 week; "0"/"none"/"off"
+##                             lists every branch). Also $GIT_WORK_MAX_AGE.
+##   -F, --fetch-only          When updating an existing worktree, fetch
+##                             only; leave the working tree untouched.
+##   -d, --dir <projects-dir>  Root to browse when not in a repo. Defaults
+##                             to the same source as `git get` (see below).
+##
+## Projects directory (when not in a repo), highest precedence first:
+##     -d / --dir <path>            (this invocation)
+##     $GIT_GET_PROJECTS_DIR        (environment override)
+##     `git config get.projectsDir` (persistent default)
+##     ~/Projects                   (built-in fallback)
+##
+## Worktree location: the repo's worktree root, ".worktree-branches/" in
+## the repo root (override with $GIT_WORKTREE_ROOT), matching the rest of
+## the suite.
+##
+## Requires `fzf` on $PATH for the interactive menus. The not-in-a-repo
+## repository browse uses `fd` when it is installed (much faster on large
+## repo trees; it walks in parallel and stops descending at each repo), and
+## falls back to `find` otherwise. Both stop at the repo root, so neither
+## walks into a repo's working tree. The browse is depth-bounded as a safety
+## valve; override the cap with $GIT_WORK_MAX_DEPTH (default 8; "0"/"none"
+## disables it).
+
+set -e
+
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
+_MAX_AGE="${GIT_WORK_MAX_AGE:-1 week}"
+_FETCH_ONLY=0
+_PROJECTS_DIR_OVERRIDE=""
+_PROJECTS_DIR_SET=0
+
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		-a|--max-age)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_MAX_AGE="$2"
+			shift
+			;;
+		--max-age=*)
+			_MAX_AGE="${1#--max-age=}"
+			;;
+		-F|--fetch-only)
+			_FETCH_ONLY=1
+			;;
+		-d|--dir)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_PROJECTS_DIR_OVERRIDE="$2"
+			_PROJECTS_DIR_SET=1
+			shift
+			;;
+		--dir=*)
+			_PROJECTS_DIR_OVERRIDE="${1#--dir=}"
+			_PROJECTS_DIR_SET=1
+			;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		--)
+			shift
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			exit 2
+			;;
+		*)
+			echo "❌ Unexpected argument: '$1'." >&2
+			exit 2
+			;;
+	esac
+	shift
+done
+
+if [ "$#" -gt 0 ]
+then
+	echo "❌ Unexpected argument: '$1'." >&2
+	exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# fzf is required for the interactive menus.
+# ---------------------------------------------------------------------------
+if ! command -v fzf >/dev/null 2>&1
+then
+	echo "❌ 'fzf' is required by 'git work' but was not found on \$PATH." >&2
+	echo "   Install it from https://github.com/junegunn/fzf (e.g. 'brew install fzf')." >&2
+	exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Resolve the max-age window to a cutoff timestamp (seconds since epoch).
+# Branches whose tip commit predates the cutoff are omitted from the menu.
+# An empty value or "0"/"none"/"off" disables the filter.
+#
+# Durations are parsed portably across GNU and BSD `date`, matching
+# git-worktree-checkout-branches.
+# ---------------------------------------------------------------------------
+_CUTOFF=0
+case "${_MAX_AGE}" in
+	""|0|none|off|None|Off|NONE|OFF)
+		_CUTOFF=0
+		;;
+	*)
+		_AGE_NUM="$(echo "${_MAX_AGE}" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\).*$/\1/p')"
+		_AGE_UNIT="$(echo "${_MAX_AGE}" | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*\([A-Za-z]*\).*$/\1/p')"
+
+		if [ -z "${_AGE_NUM}" ]
+		then
+			echo "❌ Could not parse max age '${_MAX_AGE}'." >&2
+			echo "   Try e.g. '1 week', '3 months', '90 days', or '0' to disable." >&2
+			exit 2
+		fi
+
+		case "$(echo "${_AGE_UNIT}" | tr '[:upper:]' '[:lower:]')" in
+			y|yr|yrs|year|years)       _AGE_BSD_UNIT="y" ;;
+			mo|mon|month|months)       _AGE_BSD_UNIT="m" ;;
+			w|wk|wks|week|weeks)       _AGE_BSD_UNIT="w" ;;
+			""|d|day|days)             _AGE_BSD_UNIT="d" ;;
+			h|hr|hrs|hour|hours)       _AGE_BSD_UNIT="H" ;;
+			min|mins|minute|minutes)   _AGE_BSD_UNIT="M" ;;
+			s|sec|secs|second|seconds) _AGE_BSD_UNIT="S" ;;
+			*)
+				echo "❌ Unknown max-age unit in '${_MAX_AGE}'." >&2
+				echo "   Use years, months, weeks, days, hours, minutes, or seconds." >&2
+				exit 2
+				;;
+		esac
+
+		_GNU_UNIT="${_AGE_UNIT:-days}"
+		_CUTOFF="$(date -d "${_AGE_NUM} ${_GNU_UNIT} ago" +%s 2>/dev/null \
+			|| date -v"-${_AGE_NUM}${_AGE_BSD_UNIT}" +%s 2>/dev/null \
+			|| echo "")"
+
+		if [ -z "${_CUTOFF}" ]
+		then
+			echo "❌ Could not compute cutoff for max age '${_MAX_AGE}'." >&2
+			exit 2
+		fi
+		;;
+esac
+
+# ---------------------------------------------------------------------------
+# Resolve the sibling `git-get` / `git-edit` next to this script so they
+# work regardless of install location, falling back to PATH-resolved forms.
+# ---------------------------------------------------------------------------
+_SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+_resolve_sibling() {
+	# $1: basename of the sibling command.
+	_sib="${_SCRIPT_DIR}/$1"
+	if [ -x "${_sib}" ]
+	then
+		printf '%s\n' "${_sib}"
+	elif command -v "$1" >/dev/null 2>&1
+	then
+		printf '%s\n' "$1"
+	else
+		echo "❌ Could not find the sibling '$1' command." >&2
+		return 1
+	fi
+}
+
+_GIT_GET="$(_resolve_sibling git-get)"
+_GIT_EDIT="$(_resolve_sibling git-edit)"
+_GIT_FIND="$(_resolve_sibling git-find)"
+
+# ---------------------------------------------------------------------------
+# Browse git repositories under the projects directory and print the chosen
+# repository's toplevel path.
+#
+# The repository browse lives in the sibling `git-find` command, so the
+# discovery/resolution logic has a single home. We simply forward the
+# -d/--dir override (when given) and let git-find resolve the projects
+# directory (env/config), run the fzf menu, and print the chosen toplevel on
+# its final line. git-find's own diagnostics ("📁 Browsing…", cancellation,
+# missing dir) go to stderr, so they surface here unchanged.
+# ---------------------------------------------------------------------------
+select_repo_from_projects() {
+	if [ "${_PROJECTS_DIR_SET}" -eq 1 ]
+	then
+		"${_GIT_FIND}" --dir "${_PROJECTS_DIR_OVERRIDE}"
+	else
+		"${_GIT_FIND}"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Build the interactive menu for a repository and act on the choice.
+#
+# The menu, in a single fzf, lists (each row is "<tag>\t<label>"):
+#   wt\t<path>         an existing worktree (not the current one)
+#   br\t<branch>       a recently-changed branch without a worktree
+#   new\t＋ new branch… the create-a-new-branch sentinel
+# We render an aligned, human-friendly label but key decisions off the tag
+# plus the raw value carried in a parallel, tab-delimited field.
+# ---------------------------------------------------------------------------
+run_repo_flow() {
+	_repo_toplevel="$1"
+
+	# The main (non-worktree) repository dir and the default branch, both
+	# resolved via `git -C` so this works from anywhere.
+	_git_common="$(git -C "${_repo_toplevel}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+	# The main worktree is the parent of the common .git dir.
+	_main_dir="$(dirname "${_git_common}")"
+
+	_default_branch="$(git -C "${_repo_toplevel}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
+	[ -z "${_default_branch}" ] && _default_branch="$(git -C "${_repo_toplevel}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+
+	# The worktree we're GENUINELY standing in (if any), so we can exclude
+	# it. This must be resolved from the real current directory -- NOT with
+	# `git -C "${_repo_toplevel}"`, which would always report the repo's own
+	# toplevel even when we were invoked from outside the repo (the
+	# not-in-a-repo browse flow). Using -C there wrongly made the main
+	# checkout look like "the worktree we're standing in", so the 🏠 main
+	# row was silently dropped. Resolve it plainly, then only treat it as
+	# "current" if it actually belongs to THIS repo (same common git dir);
+	# otherwise we're elsewhere and nothing in this menu is the current one.
+	_current_wt=""
+	if _here="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "${_here}" ]
+	then
+		_here_common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+		if [ "${_here_common}" = "${_git_common}" ]
+		then
+			_current_wt="${_here}"
+		fi
+	fi
+
+	# Collect branches that already have a worktree, so we don't offer them
+	# as "checkout a branch" entries (they're already covered by the
+	# worktree rows).
+	_branches_with_worktrees="$(git -C "${_repo_toplevel}" worktree list --porcelain \
+		| sed -n 's#^branch refs/heads/##p')"
+
+	# Build the menu rows into a temp file. Each line is:
+	#   <tag><TAB><value><TAB><label>
+	_menu="$(mktemp "${TMPDIR:-/tmp}/git-work-menu.XXXXXX")"
+	trap 'rm -f "${_menu}"' EXIT INT TERM
+
+	# --- Worktrees (excluding the current one). --------------------------
+	git -C "${_repo_toplevel}" worktree list --porcelain \
+		| awk '
+			# Each worktree block starts with a "worktree " line and is
+			# terminated by a blank line (the last one included), so emit on
+			# the blank terminator only -- no END clause, which would
+			# double-print the final entry.
+			/^worktree /  { path = substr($0, 10); branch = ""; bare = 0; have = 1 }
+			/^bare$/      { bare = 1 }
+			/^branch /    { branch = substr($0, 8); sub(/^refs\/heads\//, "", branch) }
+			/^detached$/  { branch = "(detached)" }
+			/^$/          { if (have && !bare) print path "\t" branch; have = 0 }
+		' \
+		| while IFS="$(printf '\t')" read -r _wt_path _wt_branch
+		do
+			# Skip the worktree we're currently in.
+			[ -n "${_current_wt}" ] && [ "${_wt_path}" = "${_current_wt}" ] && continue
+			# The main checkout (which holds the default branch) IS listed,
+			# so the default branch is reachable from the menu -- selecting
+			# it opens the main checkout in place, rather than spawning a
+			# redundant feature worktree for the default branch. It gets a
+			# distinct label so it reads as the main/default checkout. The
+			# default branch is deliberately NOT also offered as a "branch"
+			# row below (that would duplicate it, and a branch row would
+			# wrongly try to create a new worktree for it).
+			if [ "${_wt_path}" = "${_main_dir}" ]
+			then
+				_label="$(printf '🏠 %-9s %s  ·  %s' 'main' "${_wt_branch:-(default)}" "${_wt_path}")"
+			else
+				# The type column is padded to a fixed width so the names
+				# below it line up regardless of kind.
+				_label="$(printf '🌳 %-9s %s  ·  %s' 'worktree' "${_wt_branch:-(no branch)}" "${_wt_path}")"
+			fi
+			printf 'wt\t%s\t%s\n' "${_wt_path}" "${_label}" >> "${_menu}"
+		done
+
+	# --- Recently-changed branches without a worktree. -------------------
+	# Local and remote-tracking branches, filtered by the age cutoff and by
+	# not-already-a-worktree. Each candidate is classified as:
+	#   local   - a ref under refs/heads (checked out as a worktree directly)
+	#   remote  - only on a remote (git work creates a local tracking branch)
+	# so the menu can show which is which, and where a remote-only branch
+	# lives (e.g. "origin/foo").
+	#
+	# The set of local branch names, used to classify remote-tracking refs.
+	_local_branches="$(git -C "${_repo_toplevel}" for-each-ref \
+		--format='%(refname:short)' refs/heads)"
+
+	# Emit "<name><TAB><kind><TAB><detail>" rows (newest tip first), then
+	# dedup on the branch name so a branch that is both local and
+	# remote-tracking appears once (local wins, since it is listed first via
+	# the refs/heads ... refs/remotes ordering combined with the awk dedup).
+	git -C "${_repo_toplevel}" for-each-ref \
+		--sort=-committerdate \
+		--format='%(committerdate:unix)%09%(refname:short)%09%(refname)' \
+		refs/heads refs/remotes \
+		| while IFS="$(printf '\t')" read -r _ts _short _full
+		do
+			# Normalise remote-tracking names to their bare branch name,
+			# classify the kind, and skip the symbolic remote HEAD.
+			case "${_full}" in
+				refs/remotes/*)
+					# Skip the per-remote symbolic HEAD. Its full ref is
+					# "refs/remotes/<remote>/HEAD" and git abbreviates its
+					# short name to just the remote (e.g. "origin"), so a
+					# remote-tracking short name with no "/" is that HEAD.
+					case "${_full}" in
+						*/HEAD) continue ;;
+					esac
+					case "${_short}" in
+						*/*) ;;
+						*) continue ;;
+					esac
+					# Drop the remote prefix: "origin/foo" -> "foo".
+					_name="${_short#*/}"
+					# If this branch also exists locally, skip the remote row
+					# (the local one, emitted first, represents it).
+					if printf '%s\n' "${_local_branches}" | grep -qx "${_name}"
+					then
+						continue
+					fi
+					_kind="remote"
+					_detail="${_short}"
+					;;
+				*)
+					_name="${_short}"
+					_kind="local"
+					_detail=""
+					;;
+			esac
+
+			# Age filter.
+			if [ "${_CUTOFF}" -gt 0 ] && [ -n "${_ts}" ] && [ "${_ts}" -lt "${_CUTOFF}" ]
+			then
+				continue
+			fi
+
+			# Skip the default branch as a *branch* row: it's already listed
+			# above as the main checkout (🏠), which opens it in place. A
+			# branch row here would both duplicate it and wrongly try to
+			# create a feature worktree for the default branch.
+			[ "${_name}" = "${_default_branch}" ] && continue
+			[ "${_name}" = "HEAD" ] && continue
+
+			# Skip branches that already have a worktree (listed above).
+			printf '%s\n' "${_branches_with_worktrees}" | grep -qx "${_name}" && continue
+
+			printf '%s\t%s\t%s\n' "${_name}" "${_kind}" "${_detail}"
+		done \
+		| awk -F'\t' '!seen[$1]++' \
+		| while IFS="$(printf '\t')" read -r _name _kind _detail
+		do
+			if [ "${_kind}" = "remote" ]
+			then
+				# ☁️ is a wide glyph; one trailing space keeps columns aligned
+				# with the other rows' two-space emoji gap.
+				_label="$(printf '☁️ %-9s %s  ·  %s' 'remote' "${_name}" "${_detail}")"
+			else
+				_label="$(printf '🔀 %-9s %s' 'branch' "${_name}")"
+			fi
+			printf 'br\t%s\t%s\n' "${_name}" "${_label}" >> "${_menu}"
+		done
+
+	# --- New-branch sentinel. --------------------------------------------
+	printf 'new\t\t%s\n' "$(printf '➕ %-9s create a new branch…' 'new')" >> "${_menu}"
+
+	# Present the menu: fzf shows the label (3rd field) but we recover the
+	# tag + value from the hidden first two fields on the chosen line.
+	_selection="$(
+		fzf --prompt="work> " --height=80% --reverse \
+			--delimiter="$(printf '\t')" --with-nth=3 \
+			--header="$(basename "${_main_dir}") — pick a worktree / branch (ESC to cancel)" \
+			< "${_menu}"
+	)" || { echo "❌ Nothing selected." >&2; return 1; }
+
+	[ -z "${_selection}" ] && { echo "❌ Nothing selected." >&2; return 1; }
+
+	_tag="$(printf '%s\n' "${_selection}" | cut -f1)"
+	_value="$(printf '%s\n' "${_selection}" | cut -f2)"
+
+	case "${_tag}" in
+		wt)
+			act_on_worktree "${_value}" "${_main_dir}"
+			;;
+		br)
+			act_on_branch "${_main_dir}" "${_value}"
+			;;
+		new)
+			act_on_new_branch "${_main_dir}" "${_default_branch}"
+			;;
+		*)
+			echo "❌ Unrecognised selection." >&2
+			return 1
+			;;
+	esac
+}
+
+# ---------------------------------------------------------------------------
+# (1) Existing worktree: optionally update it in place, then open it.
+#
+# $2 is the repo's main checkout path (optional). When the selected path IS
+# that main checkout, call it the "main checkout" in the prompt rather than
+# a "worktree" -- technically every checkout is a worktree, but the default
+# branch's root reads better named for what it is.
+# ---------------------------------------------------------------------------
+act_on_worktree() {
+	_wt="$1"
+	_main="${2:-}"
+
+	if [ -n "${_main}" ] && [ "${_wt}" = "${_main}" ]
+	then
+		_kind_noun="main checkout"
+	else
+		_kind_noun="worktree"
+	fi
+
+	printf '🔄 Update %s '\''%s'\'' before opening? [y/N] ' "${_kind_noun}" "${_wt}" >&2
+	read -r _ans
+	case "${_ans}" in
+		y|Y|yes|Yes|YES)
+			# `git get` discover mode refreshes the repo the cwd lives in
+			# (fetch, stash, pull/rebase, re-apply). Honour --fetch-only.
+			if [ "${_FETCH_ONLY}" -eq 1 ]
+			then
+				( cd "${_wt}" && "${_GIT_GET}" --fetch-only )
+			else
+				( cd "${_wt}" && "${_GIT_GET}" )
+			fi
+			;;
+		*)
+			echo "⏭️  Skipping update." >&2
+			;;
+	esac
+
+	open_worktree "${_wt}"
+}
+
+# ---------------------------------------------------------------------------
+# (2) Existing branch: check it out as a worktree (git get -w), then open.
+# ---------------------------------------------------------------------------
+act_on_branch() {
+	_main="$1"
+	_branch="$2"
+
+	echo "➕ Checking out '${_branch}' as a worktree..." >&2
+
+	# If the branch already has a worktree (e.g. created on a previous run),
+	# just open it without touching the main checkout.
+	_wt="$(worktree_path_for_branch "${_main}" "${_branch}")"
+	if [ -n "${_wt}" ]
+	then
+		echo "⏭️  Branch '${_branch}' already has a worktree." >&2
+		open_worktree "${_wt}"
+		return
+	fi
+
+	# `git get --worktree` updates the main checkout and adds a worktree for
+	# the branch under the worktree root. Run it from the main checkout so
+	# discover mode targets the right repository. Honour --fetch-only.
+	#
+	# The update is a convenience; the actual goal is reaching the worktree.
+	# Don't let a failed update (no upstream on the default branch, a rebase
+	# conflict, etc.) block the checkout: if `git get` fails, fall back to a
+	# fetch-only run, which skips the pull/rebase but still adds the worktree.
+	if [ "${_FETCH_ONLY}" -eq 1 ]
+	then
+		( cd "${_main}" && "${_GIT_GET}" --fetch-only --worktree "${_branch}" )
+	elif ! ( cd "${_main}" && "${_GIT_GET}" --worktree "${_branch}" )
+	then
+		echo "⚠️  Update of the main checkout failed; retrying fetch-only so the" >&2
+		echo "   worktree is still created (your default branch was left as-is)." >&2
+		( cd "${_main}" && "${_GIT_GET}" --fetch-only --worktree "${_branch}" )
+	fi
+
+	_wt="$(worktree_path_for_branch "${_main}" "${_branch}")"
+	if [ -z "${_wt}" ]
+	then
+		echo "❌ Could not locate the worktree for '${_branch}' after creating it." >&2
+		exit 1
+	fi
+
+	open_worktree "${_wt}"
+}
+
+# ---------------------------------------------------------------------------
+# (3) New branch: prompt for a name, create a worktree for a fresh branch
+# off the default branch, then open it.
+# ---------------------------------------------------------------------------
+act_on_new_branch() {
+	_main="$1"
+	_default_branch="$2"
+
+	# Guide naming toward "<JIRA-ID>-<meaningful-name>" (e.g. "PROJ-123-fix-login"),
+	# which keeps branches traceable to their ticket. It's a strong recommendation,
+	# not a rule: branches without a ticket are allowed, so we never block.
+	echo "🌱 Recommended name format: <JIRA-ID>-<meaningful-name> (e.g. PROJ-123-fix-login)." >&2
+	printf '🌱 New branch name: ' >&2
+	read -r _branch
+	if [ -z "${_branch}" ]
+	then
+		echo "❌ No branch name given." >&2
+		exit 2
+	fi
+
+	# Nudge if the name doesn't lead with a JIRA-style ticket id
+	# (uppercase project key + dash + number, e.g. "ABC-123"). This is
+	# advisory only -- we proceed regardless.
+	if ! printf '%s' "${_branch}" | grep -Eq '^[A-Z][A-Z0-9]+-[0-9]+'
+	then
+		echo "💡 Tip: branches are strongly recommended to start with a JIRA ID," >&2
+		echo "   e.g. 'PROJ-123-${_branch}'. Continuing with '${_branch}'." >&2
+	fi
+
+	if git -C "${_main}" show-ref --quiet --verify "refs/heads/${_branch}"
+	then
+		echo "❌ Branch '${_branch}' already exists. Pick it from the menu instead." >&2
+		exit 1
+	fi
+
+	# Worktree root + path, mirroring git-get / worktree-checkout-branches.
+	_wt_root="${GIT_WORKTREE_ROOT:-${_main}/.worktree-branches}"
+
+	# Keep an in-repo worktree root out of git via info/exclude.
+	case "${_wt_root}" in
+		"${_main}"/*)
+			_ignore_entry="$(echo "${_wt_root#"${_main}"/}" | sed 's#/*$#/#')"
+			_exclude_file="$(git -C "${_main}" rev-parse --git-path info/exclude)"
+			if ! git -C "${_main}" check-ignore -q "${_wt_root}" 2>/dev/null
+			then
+				echo "🙈 Adding '${_ignore_entry}' to ${_exclude_file}." >&2
+				mkdir -p "$(dirname "${_exclude_file}")"
+				echo "${_ignore_entry}" >> "${_exclude_file}"
+			fi
+			;;
+	esac
+
+	mkdir -p "${_wt_root}"
+	_wt="${_wt_root}/$(echo "${_branch}" | tr '/' '-')"
+
+	if [ -e "${_wt}" ]
+	then
+		echo "❌ Worktree path '${_wt}' already exists." >&2
+		exit 1
+	fi
+
+	# Base the new branch on the default branch. Prefer the remote-tracking
+	# ref so it starts from the freshest upstream tip; fall back to the
+	# local default branch.
+	if git -C "${_main}" show-ref --quiet --verify "refs/remotes/origin/${_default_branch}"
+	then
+		_base="origin/${_default_branch}"
+	else
+		_base="${_default_branch}"
+	fi
+
+	echo "➕ Creating worktree for new branch '${_branch}' off '${_base}'..." >&2
+	git -C "${_main}" worktree add -b "${_branch}" "${_wt}" "${_base}"
+
+	open_worktree "${_wt}"
+}
+
+# ---------------------------------------------------------------------------
+# Resolve the on-disk path of the worktree holding a given branch.
+# ---------------------------------------------------------------------------
+worktree_path_for_branch() {
+	_main="$1"
+	_branch="$2"
+	git -C "${_main}" worktree list --porcelain \
+		| awk -v b="refs/heads/${_branch}" '
+			/^worktree /      { p = substr($0, 10) }
+			$0 == "branch " b { print p; exit }'
+}
+
+# ---------------------------------------------------------------------------
+# Open a worktree in the editor via `git edit --no-update` (we handle the
+# refresh ourselves, so edit should not fetch/rebase again).
+# ---------------------------------------------------------------------------
+open_worktree() {
+	_wt="$1"
+	if [ ! -d "${_wt}" ]
+	then
+		echo "❌ Worktree '${_wt}' does not exist." >&2
+		exit 1
+	fi
+	( cd "${_wt}" && exec "${_GIT_EDIT}" --no-update )
+}
+
+# ---------------------------------------------------------------------------
+# Main: if we're in a repo, run the repo flow directly; otherwise browse
+# the projects directory first.
+# ---------------------------------------------------------------------------
+if _toplevel="$(git rev-parse --show-toplevel 2>/dev/null)" && [ -n "${_toplevel}" ]
+then
+	run_repo_flow "${_toplevel}"
+else
+	echo "📂 Not in a Git repository — select one to work on." >&2
+	_repo="$(select_repo_from_projects)" || exit 1
+	run_repo_flow "${_repo}"
+fi
