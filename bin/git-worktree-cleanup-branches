@@ -7,10 +7,25 @@
 ## a remote branch that no longer exists, removes the worktree and deletes
 ## the now-orphaned local branch.
 ##
-## A branch is considered "gone" when its configured upstream is reported
-## as gone by git (i.e. `%(upstream:track)` is "[gone]"). To make that
-## signal trustworthy, stale remote-tracking refs are pruned first with
-## `git fetch --prune` (disable with --no-fetch / $GIT_WORKTREE_NO_FETCH).
+## A branch is considered "gone" when the remote no longer has a branch of
+## the same name. Two cases are handled:
+##
+##   * Branches WITH a configured upstream: git reports "[gone]" in
+##     `%(upstream:track)` once the remote branch is deleted (and the
+##     stale remote-tracking ref is pruned).
+##
+##   * Branches WITHOUT a configured upstream: this is the common case for
+##     worktrees made by `git worktree-checkout-branches`, which runs
+##     `git worktree add -b <branch> <path> <remote>/<branch>` and so sets
+##     NO upstream tracking. For these, `%(upstream:track)` is always empty
+##     (never "[gone]"), so instead we ask the remote directly whether it
+##     still has a branch of that name. If it doesn't, the worktree is
+##     gone; if it does, the worktree is kept.
+##
+## To make the first signal trustworthy, stale remote-tracking refs are
+## pruned first with `git fetch --prune`, which also refreshes the remote
+## branch list used for the second case (disable the network step with
+## --no-fetch / $GIT_WORKTREE_NO_FETCH; cleanup then uses cached refs).
 ##
 ## Because deleting branches is destructive, this prompts for confirmation
 ## per branch by default. Pass -y/--yes (or set $GIT_WORKTREE_CLEANUP_YES=1)
@@ -88,6 +103,75 @@ then
 	fi
 fi
 
+# Snapshot the branch names the remote currently advertises. This is the
+# authoritative "does the remote still have this branch?" source for
+# branches with no configured upstream (which git can't report as [gone]).
+# Asked once, up front. An empty-but-successful ls-remote (a remote with
+# zero branches) is indistinguishable in the captured output from a failed
+# one, so capture ls-remote's exit status separately and track reachability
+# explicitly -- we must not treat "couldn't ask the remote" as "the remote
+# has nothing" and delete everything.
+# Capture git's own exit status (not a pipeline's, whose status would be
+# sed's), so a failed ls-remote is never mistaken for an empty-but-ok one.
+if _REMOTE_REFS="$(git ls-remote --heads "${_REMOTE}" 2>/dev/null)"
+then
+	_REMOTE_REACHABLE=1
+	_REMOTE_BRANCHES="$(printf '%s\n' "${_REMOTE_REFS}" \
+		| sed -n 's#.*refs/heads/##p')"
+else
+	_REMOTE_REACHABLE=0
+	_REMOTE_BRANCHES=""
+	echo "⚠️  Could not list branches on '${_REMOTE}'; keeping worktrees" >&2
+	echo "   whose branch has no upstream (can't confirm they're gone)." >&2
+fi
+
+# Decide whether a worktree branch is "gone" (its remote branch no longer
+# exists). Echoes "gone" when it should be cleaned up, nothing otherwise.
+# Args: <branch-name> <upstream-track-field>.
+#
+# Order of trust:
+#   1. A configured upstream reported as "[gone]" -> gone.
+#   2. A configured upstream that is NOT gone       -> keep.
+#   3. No upstream, remote reachable: present in the remote snapshot ->
+#      keep; absent -> gone.
+#   4. No upstream, remote unreachable: we can't confirm the branch was
+#      deleted, so stay conservative and KEEP it (never delete on a guess).
+branch_is_gone() {
+	_BIG_BRANCH="$1"
+	_BIG_TRACK="$2"
+
+	# Case 1/2: branch has a real upstream -> trust git's [gone] report.
+	if [ -n "${_BIG_TRACK}" ]
+	then
+		[ "${_BIG_TRACK}" = "[gone]" ] && echo "gone"
+		return 0
+	fi
+	# An upstream can be configured yet in sync (empty track field); only
+	# treat the branch as "no upstream" when there is genuinely none.
+	if [ -n "$(git for-each-ref --format='%(upstream)' \
+		"refs/heads/${_BIG_BRANCH}")" ]
+	then
+		# Has an upstream but track is empty -> in sync, not gone.
+		return 0
+	fi
+
+	# Case 3/4: no upstream. Ask the remote snapshot.
+	if [ "${_REMOTE_REACHABLE}" -eq 1 ]
+	then
+		if printf '%s\n' "${_REMOTE_BRANCHES}" \
+			| grep -qxF "${_BIG_BRANCH}"
+		then
+			return 0        # remote still has it -> keep
+		fi
+		echo "gone"         # remote reachable, branch absent -> gone
+		return 0
+	fi
+
+	# Remote unreachable: we can't prove the branch was deleted, so keep
+	# it rather than risk removing a worktree whose remote branch is alive.
+	return 0
+}
+
 # Report, on stdout, why a worktree holds work that must not be silently
 # discarded; prints nothing when the worktree is safe to remove. Any
 # porcelain output means the tree/index is dirty (modified, staged, or
@@ -136,14 +220,16 @@ do
 				*) continue ;;
 			esac
 
-			# Is this branch's upstream gone? for-each-ref prints
-			# "[gone]" in the track field when the upstream is missing,
-			# and nothing when there is no upstream at all.
+			# Is this branch's remote counterpart gone? With a configured
+			# upstream, git reports "[gone]" in the track field; without
+			# one (the usual worktree case), branch_is_gone consults the
+			# remote branch list instead.
 			_TRACK="$(git for-each-ref \
 				--format='%(upstream:track)' \
 				"refs/heads/${_BRANCH}")"
 
-			[ "${_TRACK}" = "[gone]" ] || continue
+			[ "$(branch_is_gone "${_BRANCH}" "${_TRACK}")" = "gone" ] \
+				|| continue
 
 			# Protect worktrees with uncommitted changes unless --force
 			# was given.

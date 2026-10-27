@@ -14,12 +14,17 @@
 ##       `end` gives up then and there (it never creates an MR on top of an
 ##       uncommitted or unpushed state).
 ##   (2) makes sure the branch is on the remote: a merge request needs a
-##       pushed branch, so if `commit` left it unpushed (you chose "don't
-##       push"), `end` asks once more and pushes, or gives up if you still
-##       decline.
+##       pushed branch, so if `commit` genuinely left it unpushed (you
+##       chose "don't push"), `end` asks once more and pushes, or gives up
+##       if you still decline. It first refreshes the remote-tracking ref
+##       (a quiet fetch) so a branch the commit step already pushed isn't
+##       mistaken for unpushed and prompted for a second time.
 ##   (3) hands the MR prompt to your AI CLI tool, which creates the merge
 ##       request for the current branch -- or, if one already exists,
 ##       refreshes its description to match everything on the branch.
+##   (4) opens that merge request in your browser (via `git pr open`).
+##       Best-effort: if no browser can be opened the MR is still done, so
+##       `end` only warns.
 ##
 ## Options:
 ##   --ci-skip               Forwarded to `git work commit`: push with
@@ -222,6 +227,12 @@ fi
 _AI_TOOL="$(_resolve_ai_tool)"
 _GIT_WORK_COMMIT="$(_resolve_sibling git-work-commit)" || exit 1
 
+# Resolve the sibling `git-pr` so we can open the MR in a browser once it's
+# created/updated. Opening is best-effort (a missing git-pr or browser
+# shouldn't fail the run), so a resolution failure here is non-fatal -- we
+# just won't open a browser.
+_GIT_PR="$(_resolve_sibling git-pr 2>/dev/null)" || _GIT_PR=""
+
 # Resolve the MR prompt: an explicit --mr-prompt wins; otherwise fall back
 # to git config work.aiMrPrompt, then the built-in default. The commit
 # prompt is NOT resolved here -- when --commit-prompt isn't given, the
@@ -255,6 +266,24 @@ echo "═══ Step 2/2: merge request ═══" >&2
 # A merge request needs a pushed branch. The commit step may have left it
 # unpushed (the user chose "don't push", or there are local commits ahead
 # of the upstream). Detect that and offer to push before the MR step.
+#
+# Before judging, refresh the remote-tracking ref for the upstream. The
+# commit step's `git push` only updates the tracking ref for the branch it
+# pushed; when the commit was ALREADY on the remote the push prints
+# "Everything up-to-date" and the local tracking ref can stay stale, so a
+# plain `@{upstream}..HEAD` check would wrongly report the branch as ahead
+# and prompt for a push the commit step already handled -- the "asked
+# twice" bug. A quiet fetch of just this branch makes the check reflect the
+# true remote state. It's best-effort: if the fetch fails (offline, etc.)
+# we fall back to the unrefreshed check rather than aborting.
+if _upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
+	# @{upstream} looks like "<remote>/<branch>"; split off the remote.
+	_up_remote="${_upstream%%/*}"
+	if [ -n "${_up_remote}" ]; then
+		git fetch --quiet "${_up_remote}" "${_BRANCH}" >/dev/null 2>&1 || true
+	fi
+fi
+
 _needs_push=0
 if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
 	# No upstream at all -- definitely not on the remote.
@@ -302,6 +331,17 @@ echo "🤖 Handing the merge request to: ${_AI_TOOL}" >&2
 if ! ${_AI_TOOL} "${_MR_PROMPT}"; then
 	echo "❌ The AI CLI tool exited non-zero; merge request not confirmed." >&2
 	exit 1
+fi
+
+# Open the merge request in a browser now that it's been created/updated.
+# Best-effort: reuse the sibling `git pr open` (glab mr view --web / gh pr
+# view --web), and never let an open failure (no git-pr, no browser, MR not
+# yet queryable) fail the run -- the MR itself is already done.
+if [ -n "${_GIT_PR}" ]; then
+	echo "🌐 Opening the merge request in your browser..." >&2
+	if ! "${_GIT_PR}" open; then
+		echo "⚠️  Couldn't open the merge request in a browser; it was still created/updated." >&2
+	fi
 fi
 
 echo "✅ Done." >&2
