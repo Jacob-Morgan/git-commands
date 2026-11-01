@@ -224,6 +224,25 @@ _git_worktree_prune_branches() {
   fi
 }
 
+# git worktree-review [-t|--type <name>] [-m|--model <name>] [--all] [--wait]
+#                     [-- <roborev args>]
+# After -t/--type, offer the built-in roborev review types; after -m/--model
+# the value is free text (format varies by agent). Both values are free text,
+# so any configured type/model still works.
+_git_worktree_review() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  local prev="${COMP_WORDS[COMP_CWORD-1]}"
+  if [[ "$prev" == "-t" || "$prev" == "--type" ]]; then
+    __git_commands_complete_words "design security lookahead test-value"
+  elif [[ "$prev" == "-m" || "$prev" == "--model" ]]; then
+    COMPREPLY=() # free-text model name (format varies by agent)
+  elif [[ "$cur" == -* ]]; then
+    __git_commands_complete_words "-t --type -m --model --all --wait -h --help"
+  else
+    COMPREPLY=() # no positional arguments (extra roborev args go after --)
+  fi
+}
+
 # --- Register completions ---
 # Map each standalone command name (git-foo-bar) to its completion
 # function (_git_foo_bar) and wire it up when that function exists.
@@ -246,6 +265,7 @@ _git_commands_list=(
   git-worktree-checkout-branches
   git-worktree-cleanup-branches
   git-worktree-prune-branches
+  git-worktree-review
 )
 
 for _cmd in "${_git_commands_list[@]}"; do

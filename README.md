@@ -54,6 +54,7 @@ The suite is deliberately light on dependencies. Only the first row is required 
 - **In-place refresh** — run `git get` / `git edit` with no argument to fetch/rebase the repo you're standing in, stashing and restoring local changes around the update
 - **Per-branch worktrees** — `git worktree-checkout-branches` creates a worktree for every non-default branch, skipping stale ones (no commit in the last 3 months by default, `--max-age` to tune)
 - **Worktree cleanup** — `git worktree-cleanup-branches` (interactive) and `git worktree-prune-branches` (non-interactive) remove worktrees whose upstream branch is gone
+- **AI review across worktrees** — `git worktree-review` fans an AI review ([roborev](https://github.com/kenn-io/roborev)) across per-branch worktrees: one worktree when run inside it, all of them from the main checkout, with a configurable review type (defaults to a `design-doc` rubric)
 - **Browser launcher** — `git browse` normalizes any remote URL (SSH, `ssh://`, HTTPS) into a web URL and opens it
 - **Branch's PR/MR** — `git pr` (synonym `git mr`) detects GitHub vs GitLab from the remote and drives `gh` / `glab` to print, open, or show the pull/merge request for the current branch
 - **Pristine reset** — `git reset-hard` hard-resets to a ref and `git clean -fdx`s away every untracked and ignored artifact, stashing your tracked and untracked changes first (on by default, each toggleable) and re-applying them after
@@ -85,7 +86,8 @@ git-commands/
 │   ├── git-work-end                     # commit, then have the AI CLI tool create/update the MR
 │   ├── git-worktree-checkout-branches   # a worktree per non-default branch
 │   ├── git-worktree-cleanup-branches    # remove worktrees whose upstream is gone (interactive)
-│   └── git-worktree-prune-branches      # same, non-interactive (assumes yes)
+│   ├── git-worktree-prune-branches      # same, non-interactive (assumes yes)
+│   └── git-worktree-review              # AI-review worktrees via roborev (this one, or all)
 ├── completions/
 │   └── git-commands.bash                # bash completion for the git-<name> forms
 ├── git-commands.plugin.zsh              # zsh plugin loader (PATH, fpath, aliases, git <TAB> descriptions)
@@ -478,6 +480,42 @@ git worktree-prune-branches [-n|--dry-run] [--no-fetch] [remote]
 
 A thin wrapper around `git worktree-cleanup-branches` that assumes "yes" to every prompt, for scripts, hooks, and CI where there's no terminal to answer. All arguments are forwarded, so `--dry-run`, `--no-fetch`, `--force`, and a remote name still work. Note it only passes `--yes`, not `--force`: a worktree with uncommitted changes is still kept unless you add `--force` (or set `$GIT_WORKTREE_FORCE=1`), so unattended runs won't discard in-progress work by default.
 
+### `git worktree-review` — AI-review worktrees via roborev
+
+```sh
+git worktree-review [-t|--type <name>] [--all] [--wait] [-- <roborev args>]
+```
+
+Fans an AI code review across per-branch worktrees, delegating the actual review to [`roborev`](https://github.com/kenn-io/roborev) (`roborev review --branch --type <name>`, which reviews every commit on a worktree's branch since it diverged from the default branch). This command's job is to pick **which** worktrees get reviewed, based on where you run it:
+
+| Where you invoke it | Scope |
+|---|---|
+| In the **main checkout** (the default-branch checkout) | Fan out: review **every** worktree under the worktree root |
+| In a **linked worktree** | Review **only that** worktree's branch |
+| Outside a git repo | Fail |
+
+Scope is decided by whether you're in the main checkout or a linked worktree (not by branch name), so a feature worktree is detected correctly even when its branch resolves oddly. Pass `--all` to force the fan-out from anywhere.
+
+The **review type** defaults to `design-doc` (a custom roborev type this suite expects you to define — see below) and can be overridden per-invocation with `-t` / `--type <name>` or persistently with `$GIT_WORKTREE_REVIEW_TYPE`. Any type roborev knows works — a built-in (`design`, `security`, `lookahead`, `test-value`) or a custom type defined in `.roborev.toml` / `~/.roborev/config.toml`.
+
+| Flag | Effect |
+|---|---|
+| `-t` / `--type <name>` | Review type to run (default `design-doc`, or `$GIT_WORKTREE_REVIEW_TYPE`) |
+| `--all` | Force the fan-out over all worktrees regardless of where you invoke it |
+| `--wait` | Pass `--wait` to roborev so each review blocks until it completes (otherwise reviews are enqueued and run in the background) |
+| `--` | Everything after `--` is forwarded verbatim to each `roborev review` call (e.g. `--agent`, `--panel`, `--min-severity`) |
+
+Reviews land in roborev's shared history for the repository (linked-worktree reviews are stored against the main checkout), so `roborev tui` shows them all regardless of which worktree produced them. `roborev` must be installed and on `$PATH`; the command fails early with an install hint otherwise.
+
+**Defining the `design-doc` type.** The default type isn't built into roborev — point it at a rubric template once in your global config (`~/.roborev/config.toml`), so every repo can use it without committing review policy into the repo:
+
+```toml
+[review.types.design-doc]
+template = '~/.roborev/reviews/design-doc.md'
+```
+
+Leaving `agent` / `model` / `reasoning` unset makes the type inherit your global `default_agent`. The template is a plain Markdown rubric telling the reviewer what to check; see roborev's [custom review types](https://github.com/kenn-io/roborev/blob/main/docs/advanced/custom-review-types.md) docs. (Custom schema-constrained types require an agent with native JSON-schema output — `codex`, `claude-code`, `pi`, or `grok` — so pin `design_agent` to one of those if your default agent isn't supported.)
+
 ## Aliases
 
 Sourcing the zsh plugin defines these convenience aliases (each guarded so it never clobbers one you already have):
@@ -611,6 +649,7 @@ Example `~/.gitconfig`:
 | `$GIT_WORKTREE_MAX_AGE` | Default staleness window for `git worktree-checkout-branches` (default `3 months`; `0`/`none`/`off` disables it). The `-a`/`--max-age` flag overrides it per-invocation |
 | `$GIT_WORKTREE_CLEANUP_YES` | Set to `1` to make `git worktree-cleanup-branches` skip prompts |
 | `$GIT_WORKTREE_NO_FETCH` | Set to skip the prune-fetch in the cleanup/prune commands |
+| `$GIT_WORKTREE_REVIEW_TYPE` | Default review type for `git worktree-review` (default `design-doc`). The `-t`/`--type` flag overrides it per-invocation |
 
 ### `git browse`
 

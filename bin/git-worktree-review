@@ -1,0 +1,268 @@
+#!/bin/sh
+
+## Run an AI review (via roborev) over worktrees of the current repository.
+##
+## Delegates the actual review to `roborev review --branch --type <type>`,
+## which reviews every commit on a worktree's branch since it diverged from
+## the default branch. This command's job is to pick WHICH worktrees get
+## reviewed, based on where you invoke it:
+##
+##   * In a linked worktree  -> review only THAT worktree (its branch).
+##   * On the default branch  -> review ALL worktrees under the worktree
+##     root (the main checkout acts as "review everything").
+##   * Not in a git repo      -> fail.
+##
+## The review type defaults to 'design' (roborev's built-in design review)
+## and can be overridden with -t/--type <name> (or $GIT_WORKTREE_REVIEW_TYPE).
+## The type must be a review type roborev knows -- a built-in (e.g. design,
+## security) or a custom type defined in .roborev.toml / ~/.roborev/config.toml.
+##
+## NOTE: custom (schema-constrained) review types require an agent that
+## supports schema output (codex, claude-code, pi, grok). Agents without it
+## (e.g. kiro) can only run BUILT-IN types. To apply a custom rubric with
+## such an agent, put the rubric in a repo's .roborev.toml 'review_guidelines'
+## and use the built-in 'design' type -- see the repo's .roborev.toml.
+##
+## Usage: git worktree-review [-t|--type <name>] [-m|--model <name>]
+##                            [--all] [--wait] [-- <extra roborev args>]
+##
+## Options:
+##   -t, --type <name>   Review type to run (default: design, or
+##                       $GIT_WORKTREE_REVIEW_TYPE).
+##   -m, --model <name>  Model for the review agent, forwarded to roborev as
+##                       --model (or $GIT_WORKTREE_REVIEW_MODEL). Format varies
+##                       by agent; empty/unset uses the agent's default model.
+##   --all               Force the fan-out over all worktrees regardless of
+##                       the current branch (same as running from the
+##                       default branch).
+##   --wait              Pass --wait to roborev so each review blocks until
+##                       it completes (useful for scripts; otherwise reviews
+##                       are enqueued and run in the background).
+##   -h, --help          Show this help.
+##   --                  Everything after -- is forwarded verbatim to each
+##                       `roborev review` invocation (e.g. --agent, --panel,
+##                       --min-severity).
+##
+## The default branch is resolved from refs/remotes/<remote>/HEAD (remote
+## 'origin'), falling back to the checked-out branch. Override the worktree
+## location with $GIT_WORKTREE_ROOT (default '.worktree-branches/' in the
+## repo root).
+
+set -e
+
+_TYPE="${GIT_WORKTREE_REVIEW_TYPE:-design}"
+_MODEL="${GIT_WORKTREE_REVIEW_MODEL:-}"
+_REMOTE="origin"
+_FORCE_ALL=0
+_WAIT=0
+_EXTRA="" # forwarded roborev args, collected after --
+
+# Parse options. Everything after `--` is forwarded to roborev untouched.
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		-t|--type)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_TYPE="$2"
+			shift
+			;;
+		--type=*)
+			_TYPE="${1#--type=}"
+			;;
+		-m|--model)
+			if [ "$#" -lt 2 ]
+			then
+				echo "❌ Option '$1' requires a value." >&2
+				exit 2
+			fi
+			_MODEL="$2"
+			shift
+			;;
+		--model=*)
+			_MODEL="${1#--model=}"
+			;;
+		--all)
+			_FORCE_ALL=1
+			;;
+		--wait)
+			_WAIT=1
+			;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		--)
+			shift
+			# Remaining args are forwarded verbatim to roborev.
+			while [ "$#" -gt 0 ]
+			do
+				_EXTRA="${_EXTRA} $1"
+				shift
+			done
+			break
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			exit 2
+			;;
+		*)
+			echo "❌ Unexpected argument: '$1'." >&2
+			exit 2
+			;;
+	esac
+	shift
+done
+
+if [ -z "${_TYPE}" ]
+then
+	echo "❌ Review type must not be empty." >&2
+	exit 2
+fi
+
+# Must be in a git repository.
+if ! git rev-parse --git-dir > /dev/null 2>&1
+then
+	echo "❌ '$(basename "${PWD}")' - Not a Git repository." >&2
+	exit 1
+fi
+
+# roborev drives the actual review; fail early with an install hint.
+if ! command -v roborev > /dev/null 2>&1
+then
+	echo "❌ Could not find 'roborev' on your PATH." >&2
+	echo "   Install it from https://github.com/kenn-io/roborev" >&2
+	exit 1
+fi
+
+# Where we are now, and where the MAIN checkout is. The main checkout is the
+# first record `git worktree list --porcelain` prints, regardless of which
+# worktree we invoke from. The worktree root is always anchored to the main
+# checkout -- not `git rev-parse --show-toplevel`, which inside a linked
+# worktree points at that worktree, giving a wrong (nested) root.
+_HERE_TOPLEVEL="$(git rev-parse --show-toplevel)"
+_MAIN_TOPLEVEL="$(git worktree list --porcelain 2>/dev/null \
+	| sed -n 's/^worktree //p' | head -n 1)"
+_MAIN_TOPLEVEL="${_MAIN_TOPLEVEL:-${_HERE_TOPLEVEL}}"
+_WORKTREE_ROOT="${GIT_WORKTREE_ROOT:-${_MAIN_TOPLEVEL}/.worktree-branches}"
+
+# The default branch, resolved the same way git-worktree-checkout-branches
+# does (used only for the status message in the fan-out path).
+_DEFAULT_BRANCH="$(git symbolic-ref --quiet --short "refs/remotes/${_REMOTE}/HEAD" 2>/dev/null | sed "s#^${_REMOTE}/##")"
+_DEFAULT_BRANCH="${_DEFAULT_BRANCH:-the default branch}"
+
+_CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+
+# Review a single worktree by running roborev inside its directory. roborev
+# resolves the branch and commit range from the invoking worktree.
+_review_one() {
+	_wt_dir="$1"
+	_wt_label="$2"
+
+	if [ -n "${_MODEL}" ]
+	then
+		echo "🔎 Reviewing '${_wt_label}' (type: ${_TYPE}, model: ${_MODEL})..."
+	else
+		echo "🔎 Reviewing '${_wt_label}' (type: ${_TYPE})..."
+	fi
+	# Build the optional --model fragment: passed only when a model is set,
+	# so an unset model leaves roborev to use the agent's default. Like
+	# _EXTRA, _MODEL_ARGS is intentionally left unquoted at the call site so
+	# "--model <name>" splits into two arguments.
+	_model_args=""
+	if [ -n "${_MODEL}" ]
+	then
+		_model_args="--model ${_MODEL}"
+	fi
+	# Quote expansions; _model_args and _EXTRA are intentionally unquoted so
+	# each token becomes a separate argument.
+	if [ "${_WAIT}" -eq 1 ]
+	then
+		# shellcheck disable=SC2086
+		( cd "${_wt_dir}" && roborev review --branch --type "${_TYPE}" ${_model_args} --wait ${_EXTRA} )
+	else
+		# shellcheck disable=SC2086
+		( cd "${_wt_dir}" && roborev review --branch --type "${_TYPE}" ${_model_args} ${_EXTRA} )
+	fi
+}
+
+# Decide scope: a single worktree, or fan out over all of them.
+#
+# Fan out when invoked with --all, or when we're standing in the MAIN
+# checkout (the default-branch checkout, which acts as "review everything").
+# When we're in a linked worktree, review only that worktree. This is keyed
+# on main-vs-linked checkout rather than branch name, so a feature worktree
+# is detected correctly even if its branch happens to match the default
+# branch name or can't be resolved.
+if [ "${_FORCE_ALL}" -eq 0 ] && [ "${_HERE_TOPLEVEL}" != "${_MAIN_TOPLEVEL}" ]
+then
+	# --- Single worktree: the one we're in ---
+	_review_one "${_HERE_TOPLEVEL}" "${_CURRENT_BRANCH:-$(basename "${_HERE_TOPLEVEL}")}"
+	echo "✅ Done."
+	exit 0
+fi
+
+# --- Fan out over every worktree under the worktree root ---
+if [ ! -d "${_WORKTREE_ROOT}" ]
+then
+	echo "❌ No worktree root at '${_WORKTREE_ROOT}'." >&2
+	echo "   Create per-branch worktrees first with 'git worktree-checkout-branches'," >&2
+	echo "   or run this from inside a single worktree to review just that one." >&2
+	exit 1
+fi
+
+echo "🌳 Default branch is '${_DEFAULT_BRANCH}'; reviewing all worktrees under '${_WORKTREE_ROOT}'."
+
+_REVIEWED=0
+
+# Walk git's own worktree list so we only touch real, registered worktrees.
+# The main checkout (the default branch) is naturally excluded because it does
+# not live under the worktree root. Stream the porcelain output through a temp
+# file so the loop runs in THIS shell -- a `... | while` pipeline would run the
+# loop in a subshell, losing the _REVIEWED counter and swallowing `exit`.
+#
+# `git worktree list --porcelain` emits records separated by blank lines:
+#   worktree <path>
+#   HEAD <sha>
+#   branch refs/heads/<name>   (absent for detached HEAD)
+# and terminates every record, including the last, with a blank line.
+_LIST_FILE="$(mktemp "${TMPDIR:-/tmp}/git-worktree-review.XXXXXX")"
+trap 'rm -f "${_LIST_FILE}"' EXIT INT TERM
+git worktree list --porcelain > "${_LIST_FILE}"
+
+_CUR_PATH=""
+_CUR_BRANCH=""
+while IFS= read -r _line
+do
+	case "${_line}" in
+		"worktree "*)
+			_CUR_PATH="${_line#worktree }"
+			_CUR_BRANCH=""
+			;;
+		"branch "*)
+			_CUR_BRANCH="${_line#branch refs/heads/}"
+			;;
+		"")
+			# End of a record: act on it if it's under the worktree root.
+			case "${_CUR_PATH}" in
+				"${_WORKTREE_ROOT}"/*)
+					_label="${_CUR_BRANCH:-$(basename "${_CUR_PATH}")}"
+					_review_one "${_CUR_PATH}" "${_label}"
+					_REVIEWED=$((_REVIEWED + 1))
+					;;
+			esac
+			;;
+	esac
+done < "${_LIST_FILE}"
+
+if [ "${_REVIEWED}" -eq 0 ]
+then
+	echo "⚠️  No worktrees found under '${_WORKTREE_ROOT}'." >&2
+	echo "   Create some with 'git worktree-checkout-branches' first." >&2
+	exit 1
+fi
+
+echo "✅ Queued/ran reviews for ${_REVIEWED} worktree(s)."

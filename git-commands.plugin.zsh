@@ -56,7 +56,8 @@ zstyle ':completion:*:*:git:*' user-commands \
 	work-end:'Run work commit, then have your AI CLI tool create/update the branch'\''s MR' \
 	worktree-checkout-branches:'Check out a worktree for every non-default branch' \
 	worktree-cleanup-branches:'Remove worktrees whose upstream branch is gone (interactive)' \
-	worktree-prune-branches:'Prune gone-upstream worktrees non-interactively (assumes yes)'
+	worktree-prune-branches:'Prune gone-upstream worktrees non-interactively (assumes yes)' \
+	worktree-review:'AI-review worktrees via roborev (this one, or all from the main checkout)'
 
 # Jump to the repo root using this repo's own git-goto-root (not
 # `git rev-parse`), so the alias and the command agree on what "root"
