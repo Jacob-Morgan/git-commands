@@ -41,6 +41,13 @@
 ##     create a merge request for the current branch, ...  (built-in)
 ## A configured-but-empty work.aiMrPrompt is an error, not a fallback.
 ##
+## JIRA id in the MR title: when the branch name starts with a JIRA id
+## (e.g. `pcpp-2911-agent-updater`; same pattern as `git jira`, configurable
+## via jira.pattern), `end` appends an instruction to the MR prompt
+## requiring the title to start with the UPPER-CASE id (PCPP-2911). Branch
+## names are lower case by convention; the title uses the canonical upper
+## form. Branches without a JIRA id are unaffected.
+##
 ## The commit prompt is resolved by `git work commit` (--commit-prompt here,
 ## else git config work.aiCommitPrompt, else its built-in default).
 ##
@@ -233,6 +240,12 @@ _GIT_WORK_COMMIT="$(_resolve_sibling git-work-commit)" || exit 1
 # just won't open a browser.
 _GIT_PR="$(_resolve_sibling git-pr 2>/dev/null)" || _GIT_PR=""
 
+# Resolve the sibling `git-jira` so we can derive the branch's JIRA id and
+# require the MR title to carry it. Best-effort: a branch with no JIRA id
+# (or a missing git-jira) just means no title prefix is enforced, so a
+# resolution failure here is non-fatal.
+_GIT_JIRA="$(_resolve_sibling git-jira 2>/dev/null)" || _GIT_JIRA=""
+
 # Resolve the MR prompt: an explicit --mr-prompt wins; otherwise fall back
 # to git config work.aiMrPrompt, then the built-in default. The commit
 # prompt is NOT resolved here -- when --commit-prompt isn't given, the
@@ -240,6 +253,30 @@ _GIT_PR="$(_resolve_sibling git-pr 2>/dev/null)" || _GIT_PR=""
 # single source of truth for that key.
 if [ "${_MR_PROMPT_SET}" -eq 0 ]; then
 	_MR_PROMPT="$(_resolve_mr_prompt)"
+fi
+
+# If the branch name carries a JIRA id (e.g. a branch like
+# "pcpp-2911-agent-updater" -> PCPP-2911), require the MR title to start
+# with that id. Branch names are conventionally lower case, but the title
+# should use the canonical UPPER-CASE id, so we uppercase it here and
+# append the requirement to the MR prompt. This applies to whatever MR
+# prompt is in effect (explicit --mr-prompt, config, or the built-in
+# default) so the constraint is honoured regardless of the base prompt.
+#
+# Entirely best-effort: a branch with no JIRA id, or a missing/failed
+# git-jira, simply means no prefix is enforced -- the MR step proceeds
+# with the unmodified prompt rather than failing.
+if [ -n "${_GIT_JIRA}" ]; then
+	# `git jira id` prints the extracted id (empty + non-zero when the
+	# branch isn't JIRA-prefixed); swallow its diagnostics either way.
+	if _JIRA_ID="$("${_GIT_JIRA}" id 2>/dev/null)" && [ -n "${_JIRA_ID}" ]; then
+		# Uppercase the id for the title (branches are lower case by
+		# convention; e.g. pcpp-2911 -> PCPP-2911).
+		_JIRA_ID_UPPER="$(printf '%s' "${_JIRA_ID}" | tr '[:lower:]' '[:upper:]')"
+		_MR_PROMPT="${_MR_PROMPT}
+
+The branch is associated with JIRA issue ${_JIRA_ID_UPPER}. The merge request title MUST start with '${_JIRA_ID_UPPER}' (upper case), followed by a short description of the change, e.g. '${_JIRA_ID_UPPER} Add agent updater service'. If the title already starts with the id, leave it as-is."
+	fi
 fi
 
 # ---------------------------------------------------------------------------

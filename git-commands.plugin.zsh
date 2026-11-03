@@ -56,6 +56,7 @@ zstyle ':completion:*:*:git:*' user-commands \
 	work-end:'Run work commit, then have your AI CLI tool create/update the branch'\''s MR' \
 	worktree-checkout-branches:'Check out a worktree for every non-default branch' \
 	worktree-cleanup-branches:'Remove worktrees whose upstream branch is gone (interactive)' \
+	worktree-resync-branches:'Resync every worktree: stash, pull/rebase, then restore the stash' \
 	worktree-prune-branches:'Prune gone-upstream worktrees non-interactively (assumes yes)' \
 	worktree-review:'AI-review worktrees via roborev (this one, or all from the main checkout)'
 

@@ -51,9 +51,10 @@ The suite is deliberately light on dependencies. Only the first row is required 
 - **Work lifecycle** — `git work <subcommand>` drives a unit of work from first checkout to merge request: `start` (the fzf picker below), `commit` (stage, then hand the commit to your AI CLI tool and push), and `end` (commit, then have the AI tool create/update the branch's MR)
 - **Daily-driver picker** — `git work start` lists your worktrees, recent branches, and a "new branch" option in an fzf menu (browsing `get.projectsDir` first when you're not in a repo), then checks out and opens whatever you pick
 - **Clone-and-open** — `git edit` forwards to `git get`, then opens the resulting directory (or worktree) in your editor
-- **In-place refresh** — run `git get` / `git edit` with no argument to fetch/rebase the repo you're standing in, stashing and restoring local changes around the update
+- **In-place refresh** — run `git get` / `git edit` with no argument to sync the branch you're standing in with its own upstream (fast-forward or fork-point rebase, never onto the default branch), stashing and restoring local changes around the update
 - **Per-branch worktrees** — `git worktree-checkout-branches` creates a worktree for every non-default branch, skipping stale ones (no commit in the last 3 months by default, `--max-age` to tune)
 - **Worktree cleanup** — `git worktree-cleanup-branches` (interactive) and `git worktree-prune-branches` (non-interactive) remove worktrees whose upstream branch is gone
+- **Worktree resync** — `git worktree-resync-branches` brings every worktree up to date: stash, pull/rebase onto the latest upstream, then restore the stash (one worktree with `--this`)
 - **AI review across worktrees** — `git worktree-review` fans an AI review ([roborev](https://github.com/kenn-io/roborev)) across per-branch worktrees: one worktree when run inside it, all of them from the main checkout, with a configurable review type (defaults to a `design-doc` rubric)
 - **Browser launcher** — `git browse` normalizes any remote URL (SSH, `ssh://`, HTTPS) into a web URL and opens it
 - **Branch's PR/MR** — `git pr` (synonym `git mr`) detects GitHub vs GitLab from the remote and drives `gh` / `glab` to print, open, or show the pull/merge request for the current branch
@@ -87,6 +88,7 @@ git-commands/
 │   ├── git-worktree-checkout-branches   # a worktree per non-default branch
 │   ├── git-worktree-cleanup-branches    # remove worktrees whose upstream is gone (interactive)
 │   ├── git-worktree-prune-branches      # same, non-interactive (assumes yes)
+│   ├── git-worktree-resync-branches     # stash, pull/rebase, restore — across all worktrees
 │   └── git-worktree-review              # AI-review worktrees via roborev (this one, or all)
 ├── completions/
 │   └── git-commands.bash                # bash completion for the git-<name> forms
@@ -148,7 +150,7 @@ Clones a remote into `<projects-dir>/<host>/<path>` (trailing `.git` removed), s
 
 | Flag | Effect |
 |---|---|
-| *(default)* | Fetch, stash local changes (incl. untracked), pull/rebase onto the default branch, re-apply the stash |
+| *(default)* | Fetch, stash local changes (incl. untracked), sync the **current** branch with its own upstream (fast-forward when behind, fork-point rebase when diverged, nothing when ahead/in-sync), re-apply the stash. The branch is never rebased onto the default branch, so a clean checkout stays in sync with its own remote counterpart |
 | `--fetch-only` / `-F` | Fetch only; the working tree is left untouched |
 
 **Worktrees** — `--worktree` / `-w <name>` clones/updates the default-branch checkout, then adds a worktree for `<name>` under the repo's worktree root (`.worktree-branches/<name>`, slashes turned to dashes; override with `$GIT_WORKTREE_ROOT`). An existing worktree for the branch is left as-is. May be given at most once.
@@ -219,7 +221,7 @@ Outside a repository it first browses the git repositories under the projects di
 
 | Choice | Behaviour |
 |---|---|
-| Existing **worktree** | Prompt to update it first (fetch, stash, pull/rebase onto the default branch, re-apply — i.e. `git get` in place), then open it |
+| Existing **worktree** | Prompt to update it first (fetch, stash, sync the branch with its own upstream, re-apply — i.e. `git get` in place), then open it |
 | Existing **branch** | Check it out as a worktree under the repo's worktree root (via `git get --worktree`), then open it |
 | **New branch** | Prompt for a name, create a worktree for a fresh branch off the default branch, then open it |
 
@@ -480,6 +482,50 @@ git worktree-prune-branches [-n|--dry-run] [--no-fetch] [remote]
 
 A thin wrapper around `git worktree-cleanup-branches` that assumes "yes" to every prompt, for scripts, hooks, and CI where there's no terminal to answer. All arguments are forwarded, so `--dry-run`, `--no-fetch`, `--force`, and a remote name still work. Note it only passes `--yes`, not `--force`: a worktree with uncommitted changes is still kept unless you add `--force` (or set `$GIT_WORKTREE_FORCE=1`), so unattended runs won't discard in-progress work by default.
 
+### `git worktree-resync-branches` — bring every worktree up to date
+
+```sh
+git worktree-resync-branches [-t|--this] [--managed-only] [--no-fetch] [-n|--dry-run] [remote]
+```
+
+Resyncs the repository's worktrees in place. It fetches the remote once up front (with `--prune`), then, for **each** worktree — the main checkout plus the per-branch worktrees created by `git worktree-checkout-branches` — runs a three-step update:
+
+1. **Stash** local changes (including untracked files),
+2. **Sync** the branch against **its own upstream** — the remote branch it tracks, *not* the default branch — then
+3. **Restore** the stash.
+
+The sync step picks the right action from how the branch relates to its upstream, so a feature branch always ends in sync with its own remote counterpart rather than being rebased onto `main` behind your back:
+
+| Relationship | Action |
+|---|---|
+| Up to date | Nothing to do |
+| Behind only | Fast-forward to the upstream |
+| Ahead only | Nothing to pull — the local commits just aren't pushed yet; the branch is left as-is |
+| Diverged (ahead **and** behind) | Replay the local commits onto the upstream (from a fork point — see below), so the branch ends in sync |
+
+The upstream is the branch's configured tracking branch (`@{upstream}`) when one is set, otherwise `<remote>/<branch>` if that remote branch exists. A branch with neither (a purely local branch) is skipped — there's nothing to sync against.
+
+The diverged case rebases from a **fork point** (`git merge-base --fork-point`) rather than a plain rebase, so it converges even when the upstream rewrote history (a squash, amend, or force-push on the remote). A plain `git rebase <upstream>` would recognise your local commits that already exist upstream as rewritten copies, skip them (`skipped previously applied commit`), and leave the stale originals in place — so the branch would stay diverged after a "successful" rebase. Rebasing `--onto` the upstream from the fork point drops those duplicates and keeps only your genuinely new commits. When no fork point is available (e.g. the reflog has been expired), it falls back to a plain rebase onto the upstream.
+
+The stash is restored with apply-then-drop (not `pop`): a clean re-apply drops the entry, but a re-apply that conflicts with the freshly-synced changes **keeps** the stash so nothing is lost — the command reports the conflict and moves on to the next worktree.
+
+| Option | Effect |
+|---|---|
+| `-t` / `--this` | Resync only the worktree you're standing in, then exit |
+| `--managed-only` | In the all-worktrees sweep, only touch worktrees under the worktree root (`.worktree-branches/`), leaving the main checkout and any ad-hoc worktrees alone |
+| `--no-fetch` | Skip the up-front fetch and update against the refs the last fetch left behind (also `$GIT_WORKTREE_NO_FETCH`) |
+| `-n` / `--dry-run` | Show what each worktree's update would do; change nothing |
+
+A worktree is skipped (its working tree left untouched) when it is mid-operation (merge, rebase, cherry-pick, revert, or bisect) or has unmerged/conflicted paths — `git stash` can't write a conflicted index. Detached-HEAD and bare worktrees are skipped too (no branch to update). Skips and a conflicting stash re-apply are warnings, not fatal: the sweep processes every worktree and only the overall exit status reflects whether any need attention.
+
+| Exit | Meaning |
+|---|---|
+| `0` | Every worktree was resynced cleanly |
+| `1` | One or more worktrees weren't fully resynced (an update failed, or a stash re-apply conflicted) — the details are printed above the summary |
+| `2` | A usage error (unknown option, unexpected argument) |
+
+Override the worktree location with `$GIT_WORKTREE_ROOT`.
+
 ### `git worktree-review` — AI-review worktrees via roborev
 
 ```sh
@@ -648,7 +694,7 @@ Example `~/.gitconfig`:
 | `$GIT_WORKTREE_ROOT` | Where worktrees are created (default `.worktree-branches/` in the repo root; honored by `git get`, `git work`, and the `worktree-*` commands) |
 | `$GIT_WORKTREE_MAX_AGE` | Default staleness window for `git worktree-checkout-branches` (default `3 months`; `0`/`none`/`off` disables it). The `-a`/`--max-age` flag overrides it per-invocation |
 | `$GIT_WORKTREE_CLEANUP_YES` | Set to `1` to make `git worktree-cleanup-branches` skip prompts |
-| `$GIT_WORKTREE_NO_FETCH` | Set to skip the prune-fetch in the cleanup/prune commands |
+| `$GIT_WORKTREE_NO_FETCH` | Set to skip the up-front fetch in the cleanup/prune and resync commands |
 | `$GIT_WORKTREE_REVIEW_TYPE` | Default review type for `git worktree-review` (default `design-doc`). The `-t`/`--type` flag overrides it per-invocation |
 
 ### `git browse`

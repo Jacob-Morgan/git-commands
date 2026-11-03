@@ -224,6 +224,17 @@ _git_worktree_prune_branches() {
   fi
 }
 
+# git worktree-resync-branches [-t|--this] [--managed-only] [--no-fetch]
+#                              [-n|--dry-run] [remote]
+_git_worktree_resync_branches() {
+  local cur="${COMP_WORDS[COMP_CWORD]}"
+  if [[ "$cur" == -* ]]; then
+    __git_commands_complete_words "-t --this --managed-only --no-fetch -n --dry-run -h --help"
+  else
+    COMPREPLY=($(compgen -W "$(__git_commands_remote_names)" -- "$cur"))
+  fi
+}
+
 # git worktree-review [-t|--type <name>] [-m|--model <name>] [--all] [--wait]
 #                     [-- <roborev args>]
 # After -t/--type, offer the built-in roborev review types; after -m/--model
@@ -265,6 +276,7 @@ _git_commands_list=(
   git-worktree-checkout-branches
   git-worktree-cleanup-branches
   git-worktree-prune-branches
+  git-worktree-resync-branches
   git-worktree-review
 )
 

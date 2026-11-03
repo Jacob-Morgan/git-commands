@@ -1,0 +1,492 @@
+#!/bin/sh
+
+## Resync every branch worktree: stash, update, then restore the stash.
+##
+## Walks all of the repository's worktrees -- the main checkout plus the
+## per-branch worktrees created by `git worktree-checkout-branches` (those
+## under the worktree root) -- and brings each one up to date in place.
+## For every worktree, in turn, it:
+##
+##   1. stashes any local changes (including untracked files),
+##   2. syncs the branch against ITS OWN upstream (the remote branch it
+##      tracks -- NOT the default branch), then
+##   3. re-applies the stashed changes.
+##
+## Step 2 picks the update from how the branch relates to its upstream:
+##
+##   * up to date  -> nothing to do;
+##   * behind only -> fast-forward to the upstream;
+##   * ahead only  -> nothing to pull (local commits aren't pushed yet;
+##                    the branch is left as-is);
+##   * diverged    -> replay the local commits onto the upstream, so the
+##                    branch ends in sync with its remote counterpart.
+##
+## The diverged case rebases from a fork point (git merge-base
+## --fork-point) rather than a plain rebase, so it converges even when the
+## upstream rewrote history (squash/amend/force-push). A plain rebase would
+## SKIP our local commits that already exist upstream as rewritten copies
+## ("skipped previously applied commit") and leave the stale originals in
+## place -- the branch would stay diverged. Rebasing --onto the upstream
+## from the fork point drops those duplicates and keeps only our genuinely
+## new commits. When no fork point is available (e.g. the reflog expired),
+## it falls back to a plain rebase onto the upstream.
+##
+## The upstream is the branch's configured tracking branch (@{upstream})
+## when one is set, otherwise <remote>/<branch> if that remote branch
+## exists. A branch with neither is skipped (nothing to sync against).
+##
+## The remote is fetched once up front (with --prune) so every worktree
+## syncs against fresh remote-tracking refs; pass --no-fetch (or set
+## $GIT_WORKTREE_NO_FETCH) to skip the network step and update against
+## whatever the last fetch left behind.
+##
+## A worktree is skipped (its working tree left untouched) when it is
+## mid-operation (merge, rebase, cherry-pick, revert, or bisect) or has
+## unmerged/conflicted paths -- git could not stash a conflicted index
+## anyway. Detached-HEAD and bare worktrees are skipped too (there is no
+## branch to update). Skips are warnings, not failures: the resync moves
+## on to the next worktree and still exits successfully overall.
+##
+## By default every worktree is resynced. Limit the run to only the
+## worktree you are standing in with -t/--this (handy from inside a single
+## checkout). Restrict which worktrees the all-worktrees sweep considers to
+## those under the managed worktree root with --managed-only.
+##
+## Usage: git worktree-resync-branches [-t|--this] [--managed-only]
+##                                     [--no-fetch] [-n|--dry-run]
+##                                     [remote]
+##
+## Override the worktree location with $GIT_WORKTREE_ROOT.
+
+set -e
+
+# -t/--this: resync ONLY the worktree the caller is standing in, rather
+# than sweeping every worktree in the repo. Handy from inside a single
+# checkout when you just want that one branch brought in sync.
+_THIS_ONLY=0
+# --managed-only: in the all-worktrees sweep, touch only the worktrees
+# under the managed root (.worktree-branches/, i.e. the ones made by
+# git-worktree-checkout-branches / git-get -w), leaving the main checkout
+# and any ad-hoc worktrees alone. No effect under --this.
+_MANAGED_ONLY=0
+_DRY_RUN=0
+_FETCH=1
+[ -n "${GIT_WORKTREE_NO_FETCH}" ] && _FETCH=0
+_REMOTE=""
+
+# Parse options. Positional arg (if any) is the remote name.
+while [ "$#" -gt 0 ]
+do
+	case "$1" in
+		-t|--this)        _THIS_ONLY=1 ;;
+		--managed-only)   _MANAGED_ONLY=1 ;;
+		--no-fetch)       _FETCH=0 ;;
+		-n|--dry-run)     _DRY_RUN=1 ;;
+		-h|--help)
+			sed -n 's/^## \{0,1\}//p' "$0"
+			exit 0
+			;;
+		-*)
+			echo "❌ Unknown option: '$1'." >&2
+			exit 2
+			;;
+		*)
+			if [ -n "${_REMOTE}" ]
+			then
+				echo "❌ Unexpected argument: '$1'." >&2
+				exit 2
+			fi
+			_REMOTE="$1"
+			;;
+	esac
+	shift
+done
+
+_REMOTE="${_REMOTE:-origin}"
+
+# User is not in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1
+then
+	echo "❌ '$(basename "${PWD}")' - Not a Git repository." >&2
+	exit 1
+fi
+
+_TOPLEVEL="$(git rev-parse --show-toplevel)"
+_WORKTREE_ROOT="${GIT_WORKTREE_ROOT:-${_TOPLEVEL}/.worktree-branches}"
+
+# The worktree we are standing in (used by --this, and to report where the
+# all-worktrees sweep is currently operating relative to the caller).
+_THIS_WT=""
+if _THIS_WT="$(git rev-parse --show-toplevel 2>/dev/null)"
+then
+	:
+else
+	_THIS_WT=""
+fi
+
+# ---------------------------------------------------------------------------
+# Report, on stdout, why a worktree is UNSAFE to update in place (stash +
+# pull/rebase), and return 0; print nothing and return 1 when it is clear.
+#
+# "In progress" is detected from the sentinel files git writes under the
+# (per-worktree) git dir, resolved via `git rev-parse --git-path` so it is
+# correct inside a linked worktree. Unmerged paths are detected from the
+# conflict-shaped XY porcelain status codes. Mirrors git-get's blocker.
+# ---------------------------------------------------------------------------
+_update_blocker() {
+	_dir="$1"
+
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path MERGE_HEAD 2>/dev/null)" ]
+	then
+		printf 'a merge is in progress'
+		return 0
+	fi
+	if [ -d "$(git -C "${_dir}" rev-parse --git-path rebase-merge 2>/dev/null)" ] \
+		|| [ -d "$(git -C "${_dir}" rev-parse --git-path rebase-apply 2>/dev/null)" ]
+	then
+		printf 'a rebase is in progress'
+		return 0
+	fi
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path CHERRY_PICK_HEAD 2>/dev/null)" ]
+	then
+		printf 'a cherry-pick is in progress'
+		return 0
+	fi
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path REVERT_HEAD 2>/dev/null)" ]
+	then
+		printf 'a revert is in progress'
+		return 0
+	fi
+	if [ -e "$(git -C "${_dir}" rev-parse --git-path BISECT_LOG 2>/dev/null)" ]
+	then
+		printf 'a bisect is in progress'
+		return 0
+	fi
+
+	if git -C "${_dir}" status --porcelain 2>/dev/null \
+		| grep -Eq '^(DD|AU|UD|UA|DU|AA|UU) '
+	then
+		printf 'there are unmerged (conflicted) paths'
+		return 0
+	fi
+
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# Resync a single worktree in place: stash, pull/rebase, restore the stash.
+# Operates via `git -C` so it is cwd- and worktree-independent. Returns 0 on
+# success or a benign skip, non-zero only on a hard failure the caller
+# should surface.
+#
+# Args: <worktree-path> <branch-name>
+# ---------------------------------------------------------------------------
+resync_worktree() {
+	_dir="$1"
+	_branch="$2"
+
+	echo "──────────────────────────────────────────────"
+	echo "🌳 Resyncing '${_branch}' at '${_dir}'..."
+
+	# Refuse to touch the working tree when it is not safe to stash (an
+	# operation is in progress, or there are unmerged paths): git stash
+	# cannot write a conflicted index. Skip, but do not fail the run.
+	if _blocker="$(_update_blocker "${_dir}")"
+	then
+		echo "⚠️  Skipping '${_branch}': ${_blocker}." >&2
+		echo "   Resolve it, then re-run to update this worktree." >&2
+		return 0
+	fi
+
+	# Resolve the branch's OWN upstream -- the remote branch this one
+	# tracks (refs/remotes/<remote>/<branch> in the common case). "Resync"
+	# means "get in sync with this branch's own upstream", NOT with the
+	# default branch, so we never rebase a feature branch onto origin/main
+	# behind the user's back (doing so leaves the branch diverged from its
+	# real counterpart, which is the bug this fixes).
+	#
+	#   * Prefer the configured upstream (@{upstream}) when one is set.
+	#   * Fall back to <remote>/<branch> when no upstream is configured but
+	#     a same-named remote branch exists (worktrees made by
+	#     git-worktree-checkout-branches often have no upstream set).
+	#   * If neither exists, there is nothing to sync against -> skip.
+	_upstream="$(git -C "${_dir}" rev-parse --abbrev-ref --symbolic-full-name \
+		'@{upstream}' 2>/dev/null || true)"
+	if [ -z "${_upstream}" ]
+	then
+		if git -C "${_dir}" show-ref --quiet --verify \
+			"refs/remotes/${_REMOTE}/${_branch}"
+		then
+			_upstream="${_REMOTE}/${_branch}"
+		fi
+	fi
+
+	if [ -z "${_upstream}" ]
+	then
+		echo "⚠️  Skipping '${_branch}': no upstream to sync against" >&2
+		echo "   (no tracking branch configured and no '${_REMOTE}/${_branch}')." >&2
+		return 0
+	fi
+
+	# Count how HEAD relates to its upstream: commits the upstream has that
+	# we don't (behind) and commits we have that it doesn't (ahead). This
+	# picks the right update: fast-forward when only behind, rebase when
+	# diverged, nothing when up to date or only ahead.
+	_counts="$(git -C "${_dir}" rev-list --left-right --count \
+		"HEAD...${_upstream}" 2>/dev/null || true)"
+	_ahead="$(printf '%s\n' "${_counts}" | awk '{print $1+0}')"
+	_behind="$(printf '%s\n' "${_counts}" | awk '{print $2+0}')"
+	[ -z "${_ahead}" ] && _ahead=0
+	[ -z "${_behind}" ] && _behind=0
+
+	# Decide the action from the ahead/behind relationship.
+	#   behind=0, ahead=0  -> up to date      (no-op)
+	#   behind>0, ahead=0  -> behind only      (fast-forward)
+	#   behind=0, ahead>0  -> ahead only       (local commits unpushed; leave)
+	#   behind>0, ahead>0  -> diverged         (rebase onto upstream)
+	_action="uptodate"
+	if [ "${_behind}" -gt 0 ] && [ "${_ahead}" -eq 0 ]
+	then
+		_action="ff"
+	elif [ "${_behind}" -eq 0 ] && [ "${_ahead}" -gt 0 ]
+	then
+		_action="ahead"
+	elif [ "${_behind}" -gt 0 ] && [ "${_ahead}" -gt 0 ]
+	then
+		_action="rebase"
+	fi
+
+	if [ "${_DRY_RUN}" -eq 1 ]
+	then
+		case "${_action}" in
+			uptodate)
+				echo "🔎 '${_branch}' is already in sync with '${_upstream}'; nothing to do." ;;
+			ff)
+				echo "🔎 Would stash, fast-forward '${_branch}' to '${_upstream}' (behind ${_behind}), then restore the stash." ;;
+			ahead)
+				echo "🔎 '${_branch}' is ahead of '${_upstream}' by ${_ahead} (unpushed); nothing to pull." ;;
+			rebase)
+				echo "🔎 Would stash, rebase '${_branch}' onto '${_upstream}' (ahead ${_ahead}, behind ${_behind}), then restore the stash." ;;
+		esac
+		return 0
+	fi
+
+	# Nothing to do when already in sync or only ahead: skip the stash
+	# dance entirely so we never churn a clean, up-to-date worktree.
+	if [ "${_action}" = "uptodate" ]
+	then
+		echo "✅ '${_branch}' already in sync with '${_upstream}'."
+		return 0
+	fi
+	if [ "${_action}" = "ahead" ]
+	then
+		echo "ℹ️  '${_branch}' is ahead of '${_upstream}' by ${_ahead} commit(s) (unpushed); nothing to pull."
+		return 0
+	fi
+
+	# 1. Stash any local changes (including untracked) so the update has a
+	#    clean tree to work with.
+	_stashed=0
+	if [ -n "$(git -C "${_dir}" status --porcelain)" ]
+	then
+		echo "📦 Stashing local changes..."
+		git -C "${_dir}" stash push --include-untracked \
+			--message "git-worktree-resync-branches on $(date)" >/dev/null
+		_stashed=1
+	fi
+
+	# 2. Sync against the branch's OWN upstream. A failure here (e.g. a
+	#    rebase that hits a conflict) leaves this worktree mid-operation.
+	#    We do NOT let `set -e` abort the whole sweep: report the worktree
+	#    and move on, leaving the local work safe in the stash entry. The
+	#    caller surfaces a non-zero overall exit.
+	_update_failed=0
+	if [ "${_action}" = "ff" ]
+	then
+		echo "🔀 Fast-forwarding '${_branch}' to '${_upstream}' (behind ${_behind})..."
+		git -C "${_dir}" merge --ff-only "${_upstream}" || _update_failed=1
+	else
+		# Diverged: replay our local commits on top of the upstream.
+		#
+		# A plain `git rebase <upstream>` is wrong when the upstream's
+		# "new" commits are rewritten copies of our own (a squash/amend/
+		# force-push on the remote): rebase recognises them as already
+		# applied and SKIPS them ("skipped previously applied commit"),
+		# leaving our stale originals in place -- so the branch stays
+		# diverged even after a "successful" rebase. That is exactly the
+		# case that looked resynced but wasn't.
+		#
+		# Rebasing with --onto from a fork point fixes both cases. The
+		# fork point (via the reflog) is where our local branch and the
+		# upstream last agreed, BEFORE the upstream rewrote history. We
+		# move only the commits AFTER that point onto the new upstream
+		# tip, which drops the stale duplicates and keeps our genuinely
+		# new work. When the upstream was a clean append (no rewrite), the
+		# fork point is the old upstream tip and this behaves just like a
+		# normal rebase.
+		#
+		# If no fork point can be found (e.g. the reflog was expired), we
+		# fall back to a plain rebase onto the upstream -- the same
+		# behaviour as before, still correct for true divergence.
+		_fork_point="$(git -C "${_dir}" merge-base --fork-point \
+			"${_upstream}" HEAD 2>/dev/null || true)"
+
+		if [ -n "${_fork_point}" ]
+		then
+			echo "🔀 Rebasing '${_branch}' onto '${_upstream}' (ahead ${_ahead}, behind ${_behind}; fork point $(git -C "${_dir}" rev-parse --short "${_fork_point}"))..."
+			git -C "${_dir}" rebase --onto "${_upstream}" "${_fork_point}" \
+				|| _update_failed=1
+		else
+			echo "🔀 Rebasing '${_branch}' onto '${_upstream}' (ahead ${_ahead}, behind ${_behind}; no fork point, full rebase)..."
+			git -C "${_dir}" rebase "${_upstream}" || _update_failed=1
+		fi
+	fi
+
+	if [ "${_update_failed}" -eq 1 ]
+	then
+		echo "❌ Could not update '${_branch}' (${_action} against '${_upstream}' failed)." >&2
+		if [ "${_stashed}" -eq 1 ]
+		then
+			echo "   Your local changes are safe in the latest stash entry;" >&2
+			echo "   resolve the worktree, then 'git stash pop' to restore them." >&2
+		fi
+		return 1
+	fi
+
+	# 3. Restore any stashed changes. Use apply-then-drop (not pop) so a
+	#    conflicting re-apply keeps the stash entry instead of discarding
+	#    it, leaving the local work recoverable by hand. A clean apply
+	#    drops the entry just as pop would. Mirrors git-reset-hard's stash
+	#    handling.
+	if [ "${_stashed}" -eq 1 ]
+	then
+		echo "📦 Re-applying stashed changes..."
+		if git -C "${_dir}" stash apply >/dev/null 2>&1
+		then
+			git -C "${_dir}" stash drop >/dev/null 2>&1 || true
+		else
+			# Re-run visibly so the conflict markers / status are shown.
+			git -C "${_dir}" stash apply || true
+			echo "⚠️  Re-applying the stash hit conflicts in '${_branch}'." >&2
+			echo "   The stash entry was kept; resolve the conflicts, then" >&2
+			echo "   'git stash drop' once you are done." >&2
+			return 1
+		fi
+	fi
+
+	echo "✅ Resynced '${_branch}'."
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# Fetch the remote once up front so every worktree rebases against fresh
+# remote-tracking refs. Tolerate an unreachable remote: a resync can still
+# proceed (fast-forward/rebase will just be a no-op against stale refs).
+# ---------------------------------------------------------------------------
+if [ "${_FETCH}" -eq 1 ] && [ "${_DRY_RUN}" -eq 0 ]
+then
+	echo "🔄 Fetching from '${_REMOTE}'..."
+	if ! git fetch --prune "${_REMOTE}"
+	then
+		echo "⚠️  Could not fetch from '${_REMOTE}'; updating against cached refs." >&2
+	fi
+fi
+
+# ---------------------------------------------------------------------------
+# --this: resync ONLY the worktree the caller is standing in, then exit --
+# the single-worktree alternative to the all-worktrees sweep below. We use
+# _THIS_WT (the toplevel of the current working tree, resolved earlier) as
+# the one worktree to act on. It requires being inside a worktree, and is
+# skipped on a detached HEAD since there is no branch to sync. --managed-only
+# has no effect here: --this already names exactly one worktree.
+# ---------------------------------------------------------------------------
+if [ "${_THIS_ONLY}" -eq 1 ]
+then
+	if [ -z "${_THIS_WT}" ]
+	then
+		echo "❌ --this requires being inside a worktree." >&2
+		exit 1
+	fi
+	_branch="$(git -C "${_THIS_WT}" symbolic-ref --quiet --short HEAD 2>/dev/null)"
+	if [ -z "${_branch}" ]
+	then
+		echo "⚠️  Skipping '${_THIS_WT}': detached HEAD (no branch to update)." >&2
+		echo "✅ Done."
+		exit 0
+	fi
+	_rc=0
+	resync_worktree "${_THIS_WT}" "${_branch}" || _rc=1
+	if [ "${_rc}" -ne 0 ]
+	then
+		echo "──────────────────────────────────────────────"
+		echo "⚠️  Done with issues (see above)."
+		exit 1
+	fi
+	echo "✅ Done."
+	exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Resync every worktree. The porcelain output lists each worktree as a
+# "worktree <path>" line followed (for a normal checkout) by a
+# "branch refs/heads/<name>" line; a detached or bare worktree has no
+# branch line, so we skip it. We pair the two up as we walk.
+#
+# Note the loop body runs in a subshell under the pipe, so per-worktree
+# state (the stash flag) stays local to resync_worktree -- no counters are
+# carried across iterations here. A worktree that fails to resync does not
+# abort the sweep: we record a failure in _FAILED and press on, then exit
+# the subshell with that flag so the overall command reports it.
+# ---------------------------------------------------------------------------
+echo "🌳 Resyncing all worktrees..."
+if [ "${_MANAGED_ONLY}" -eq 1 ]
+then
+	echo "🔎 Limiting to worktrees under '${_WORKTREE_ROOT}'."
+fi
+
+_rc=0
+_WT_PATH=""
+git worktree list --porcelain | {
+	_FAILED=0
+	while IFS= read -r _line
+	do
+		case "${_line}" in
+			"worktree "*)
+				_WT_PATH="${_line#worktree }"
+				;;
+			"branch refs/heads/"*)
+				_branch="${_line#branch refs/heads/}"
+
+				# --managed-only restricts the sweep to the worktrees this
+				# suite manages -- those living under the worktree root
+				# (.worktree-branches/) -- so the main checkout and any
+				# worktrees you added by hand elsewhere are left untouched.
+				# Without it, every worktree the repo has is resynced. We
+				# keep a worktree only when its path is under the root
+				# (the trailing "/" makes the glob a true prefix match, so
+				# a sibling like ".worktree-branches-old" isn't matched).
+				if [ "${_MANAGED_ONLY}" -eq 1 ]
+				then
+					case "${_WT_PATH}/" in
+						"${_WORKTREE_ROOT}"/*) ;;
+						*) continue ;;
+					esac
+				fi
+
+				resync_worktree "${_WT_PATH}" "${_branch}" || _FAILED=1
+				;;
+			"detached")
+				echo "⚠️  Skipping '${_WT_PATH}': detached HEAD (no branch to update)." >&2
+				;;
+		esac
+	done
+	exit "${_FAILED}"
+} || _rc=1
+
+echo "──────────────────────────────────────────────"
+if [ "${_rc}" -ne 0 ]
+then
+	echo "⚠️  Done with issues (one or more worktrees were not fully resynced; see above)."
+	exit 1
+fi
+echo "✅ Done."

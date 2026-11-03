@@ -31,14 +31,18 @@
 ##   - Not in a Git repo -> fail.
 ##
 ## Update modes (only when the target already exists):
-##   (a) full (default): fetch, stash any local changes, pull/rebase onto
-##       the default branch, then re-apply the stash. Mirrors `git update`.
+##   (a) full (default): fetch, stash any local changes, fast-forward the
+##       CURRENT branch from its own upstream, then re-apply the stash. The
+##       branch is only ever fast-forwarded from the remote branch it
+##       tracks -- it is never rebased onto the default branch, so a clean
+##       checkout stays in sync with its upstream rather than diverging. A
+##       branch with no upstream is left untouched (nothing to pull).
 ##   (b) --fetch-only / -F: fetch only; working tree is left untouched.
 ##
 ##   In full mode, if the checkout is mid-operation (merge, rebase,
 ##   cherry-pick, revert, or bisect) or has unmerged/conflicted paths, the
 ##   working-tree update is SKIPPED -- the fetch still refreshes the
-##   remote-tracking refs, but the stash/pull/rebase is not attempted (it
+##   remote-tracking refs, but the stash/fast-forward is not attempted (it
 ##   could not stash a conflicted index anyway). git-get prints a warning
 ##   and exits successfully, so callers that open the checkout afterwards
 ##   (e.g. `git work start`) still let you finish resolving it by hand.
@@ -317,9 +321,9 @@ _update_blocker() {
 
 # ---------------------------------------------------------------------------
 # Update an existing checkout. In --fetch-only mode this just fetches; the
-# full mode fetches, stashes local changes, pulls/rebases onto the default
-# branch, then restores the stash. Operates via `git -C` so it is worktree-
-# and cwd-independent.
+# full mode fetches, stashes local changes, fast-forwards the current branch
+# from its own upstream, then restores the stash. Operates via `git -C` so it
+# is worktree- and cwd-independent.
 # ---------------------------------------------------------------------------
 update_repo() {
 	_dir="$1"
@@ -368,21 +372,80 @@ update_repo() {
 		_stashed=1
 	fi
 
-	# Resolve the default branch and the current branch.
-	_default_branch="$(git -C "${_dir}" symbolic-ref --quiet --short \
-		refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##')"
-	[ -z "${_default_branch}" ] && _default_branch="$(git -C "${_dir}" \
-		rev-parse --abbrev-ref HEAD 2>/dev/null)"
+	# Resolve the current branch.
 	_current_branch="$(git -C "${_dir}" rev-parse --abbrev-ref HEAD 2>/dev/null)"
 
-	if [ "${_current_branch}" = "${_default_branch}" ]
+	# Sync the CURRENT branch against ITS OWN upstream -- the remote branch
+	# it tracks -- NOT the default branch. "Refresh where I stand" means
+	# bringing the branch in line with its remote counterpart. Rebasing a
+	# feature branch onto origin/<default> here (the previous behaviour)
+	# rewrote the branch's own commits with new SHAs and left it diverged
+	# from its upstream even when there were no local changes -- surprising
+	# and divergence-inducing. This mirrors git-worktree-resync-branches.
+	#
+	# Resolve the upstream:
+	#   * Prefer the configured tracking branch (@{upstream}).
+	#   * Fall back to origin/<branch> when none is configured but a
+	#     same-named remote branch exists (worktrees created by
+	#     git-worktree-checkout-branches often have no upstream set).
+	#   * If neither exists (a purely local branch never pushed), there is
+	#     nothing to sync against -> leave the branch untouched.
+	_upstream="$(git -C "${_dir}" rev-parse --abbrev-ref --symbolic-full-name \
+		'@{upstream}' 2>/dev/null || true)"
+	if [ -z "${_upstream}" ] \
+		&& git -C "${_dir}" show-ref --quiet --verify \
+			"refs/remotes/origin/${_current_branch}"
 	then
-		echo "🔀 Pulling '${_current_branch}'..."
-		git -C "${_dir}" pull --ff-only
+		_upstream="origin/${_current_branch}"
+	fi
+
+	if [ -z "${_upstream}" ]
+	then
+		echo "⏭️  '${_current_branch}' has no upstream to sync against; leaving it as-is."
 	else
-		echo "🔀 Rebasing '${_current_branch}' onto 'origin/${_default_branch}'..."
-		git -C "${_dir}" pull --ff-only || true
-		git -C "${_dir}" rebase "origin/${_default_branch}"
+		# Count how HEAD relates to its upstream to pick the right action:
+		#   behind only -> fast-forward
+		#   ahead only  -> local commits unpushed; leave it
+		#   diverged    -> rebase our commits onto the upstream
+		#   up to date  -> nothing to do
+		_counts="$(git -C "${_dir}" rev-list --left-right --count \
+			"HEAD...${_upstream}" 2>/dev/null || true)"
+		_ahead="$(printf '%s\n' "${_counts}" | awk '{print $1+0}')"
+		_behind="$(printf '%s\n' "${_counts}" | awk '{print $2+0}')"
+		[ -z "${_ahead}" ] && _ahead=0
+		[ -z "${_behind}" ] && _behind=0
+
+		if [ "${_behind}" -eq 0 ] && [ "${_ahead}" -eq 0 ]
+		then
+			echo "✅ '${_current_branch}' already in sync with '${_upstream}'."
+		elif [ "${_behind}" -eq 0 ] && [ "${_ahead}" -gt 0 ]
+		then
+			echo "ℹ️  '${_current_branch}' is ahead of '${_upstream}' by ${_ahead} commit(s) (unpushed); nothing to pull."
+		elif [ "${_behind}" -gt 0 ] && [ "${_ahead}" -eq 0 ]
+		then
+			echo "🔀 Fast-forwarding '${_current_branch}' to '${_upstream}' (behind ${_behind})..."
+			git -C "${_dir}" merge --ff-only "${_upstream}"
+		else
+			# Diverged. Rebase with --onto from the fork point rather than a
+			# plain `git rebase <upstream>`: when the upstream rewrote
+			# history (squash/amend/force-push), a plain rebase recognises
+			# our local commits as already-applied copies, skips them, and
+			# leaves the stale originals in place -- so the branch stays
+			# diverged after a "successful" rebase. Replaying only the
+			# commits after the fork point drops those duplicates and keeps
+			# our genuinely new work. With no fork point (reflog expired),
+			# fall back to a plain rebase onto the upstream.
+			_fork_point="$(git -C "${_dir}" merge-base --fork-point \
+				"${_upstream}" HEAD 2>/dev/null || true)"
+			if [ -n "${_fork_point}" ]
+			then
+				echo "🔀 Rebasing '${_current_branch}' onto '${_upstream}' (ahead ${_ahead}, behind ${_behind}; fork point $(git -C "${_dir}" rev-parse --short "${_fork_point}"))..."
+				git -C "${_dir}" rebase --onto "${_upstream}" "${_fork_point}"
+			else
+				echo "🔀 Rebasing '${_current_branch}' onto '${_upstream}' (ahead ${_ahead}, behind ${_behind}; no fork point, full rebase)..."
+				git -C "${_dir}" rebase "${_upstream}"
+			fi
+		fi
 	fi
 
 	# Restore any stashed changes.
