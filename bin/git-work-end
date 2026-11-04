@@ -311,24 +311,63 @@ echo "═══ Step 2/2: merge request ═══" >&2
 # "Everything up-to-date" and the local tracking ref can stay stale, so a
 # plain `@{upstream}..HEAD` check would wrongly report the branch as ahead
 # and prompt for a push the commit step already handled -- the "asked
-# twice" bug. A quiet fetch of just this branch makes the check reflect the
-# true remote state. It's best-effort: if the fetch fails (offline, etc.)
-# we fall back to the unrefreshed check rather than aborting.
+# twice" bug.
+#
+# The authoritative question is "does the remote already have this exact
+# HEAD?", and only the remote can answer it. The local tracking ref
+# (origin/<branch>) is a cache that can lag behind what the commit step
+# just pushed -- a stale cache is the whole reason this bug exists -- so we
+# don't trust it as the primary signal. Instead we ask the remote directly
+# with `git ls-remote`, which reports the branch's real tip without needing
+# a fetch to update any local ref. If the remote's tip equals HEAD, the
+# commit step already pushed everything and we must NOT prompt again.
+#
+# The remote query is best-effort: if it fails (offline, auth trouble, no
+# upstream configured) we fall back to the local tracking-ref comparison,
+# refreshing it with a quiet fetch first so that fallback is as accurate as
+# we can make it.
+_needs_push=0
+_remote_decided=0
+
 if _upstream="$(git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null)"; then
 	# @{upstream} looks like "<remote>/<branch>"; split off the remote.
 	_up_remote="${_upstream%%/*}"
 	if [ -n "${_up_remote}" ]; then
-		git fetch --quiet "${_up_remote}" "${_BRANCH}" >/dev/null 2>&1 || true
+		# Ask the remote for the branch's current tip. On success this is
+		# a single "<sha>\t<ref>" line; an empty result means the remote
+		# has no such branch (so it genuinely needs pushing).
+		if _remote_line="$(git ls-remote --heads "${_up_remote}" "${_BRANCH}" 2>/dev/null)"; then
+			_remote_decided=1
+			_remote_sha="${_remote_line%%	*}"   # cut at the tab
+			_head_sha="$(git rev-parse HEAD 2>/dev/null)"
+			if [ -z "${_remote_sha}" ]; then
+				# Branch absent on the remote -- not pushed.
+				_needs_push=1
+			elif [ "${_remote_sha}" != "${_head_sha}" ]; then
+				# Remote tip differs from HEAD -- local work not on it yet.
+				_needs_push=1
+			fi
+			# Refresh the local tracking ref too, so a later `git pr open`
+			# and the MR tool see the same truth. Best-effort.
+			git fetch --quiet "${_up_remote}" "${_BRANCH}" >/dev/null 2>&1 || true
+		else
+			# Couldn't reach the remote; fall back to the tracking ref,
+			# refreshed as best we can.
+			git fetch --quiet "${_up_remote}" "${_BRANCH}" >/dev/null 2>&1 || true
+		fi
 	fi
 fi
 
-_needs_push=0
-if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
-	# No upstream at all -- definitely not on the remote.
-	_needs_push=1
-elif [ -n "$(git rev-list '@{upstream}..HEAD' 2>/dev/null)" ]; then
-	# Local commits not yet on the upstream.
-	_needs_push=1
+# Fallback path: the remote couldn't answer (offline, no upstream, etc.),
+# so judge from local state.
+if [ "${_remote_decided}" -eq 0 ]; then
+	if ! git rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+		# No upstream at all -- definitely not on the remote.
+		_needs_push=1
+	elif [ -n "$(git rev-list '@{upstream}..HEAD' 2>/dev/null)" ]; then
+		# Local commits not yet on the upstream.
+		_needs_push=1
+	fi
 fi
 
 if [ "${_needs_push}" -eq 1 ]; then
