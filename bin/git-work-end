@@ -44,9 +44,10 @@
 ## JIRA id in the MR title: when the branch name starts with a JIRA id
 ## (e.g. `pcpp-2911-agent-updater`; same pattern as `git jira`, configurable
 ## via jira.pattern), `end` appends an instruction to the MR prompt
-## requiring the title to start with the UPPER-CASE id (PCPP-2911). Branch
-## names are lower case by convention; the title uses the canonical upper
-## form. Branches without a JIRA id are unaffected.
+## requiring the title to be formatted as `<JIRA-ID>: <title>` with the
+## UPPER-CASE id (e.g. `PCPP-2911: Add agent updater service`). Branch names
+## are lower case by convention; the title uses the canonical upper form.
+## Branches without a JIRA id are unaffected.
 ##
 ## The commit prompt is resolved by `git work commit` (--commit-prompt here,
 ## else git config work.aiCommitPrompt, else its built-in default).
@@ -275,7 +276,7 @@ if [ -n "${_GIT_JIRA}" ]; then
 		_JIRA_ID_UPPER="$(printf '%s' "${_JIRA_ID}" | tr '[:lower:]' '[:upper:]')"
 		_MR_PROMPT="${_MR_PROMPT}
 
-The branch is associated with JIRA issue ${_JIRA_ID_UPPER}. The merge request title MUST start with '${_JIRA_ID_UPPER}' (upper case), followed by a short description of the change, e.g. '${_JIRA_ID_UPPER} Add agent updater service'. If the title already starts with the id, leave it as-is."
+The branch is associated with JIRA issue ${_JIRA_ID_UPPER}. The merge request title MUST be formatted as '${_JIRA_ID_UPPER}: <title>' -- the upper-case JIRA id, then a colon and a space, then a short description of the change, e.g. '${_JIRA_ID_UPPER}: Add agent updater service'. If the title already starts with '${_JIRA_ID_UPPER}: ', leave it as-is."
 	fi
 fi
 
